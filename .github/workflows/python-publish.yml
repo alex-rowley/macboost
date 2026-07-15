@@ -37,9 +37,12 @@ jobs:
       run: |
         gh release upload "$GITHUB_REF_NAME" python/dist/*.whl \
             .build/release/macboost --clobber
+    # pypa/gh-action-pypi-publish is Linux-only; this job must run on macOS
+    # to build the Metal dylib, so upload with twine directly.
     - name: Publish package
-      uses: pypa/gh-action-pypi-publish@release/v1
-      with:
-        user: __token__
-        password: ${{ secrets.PYPI_API_TOKEN }}
-        packages-dir: python/dist
+      env:
+        TWINE_USERNAME: __token__
+        TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+      run: |
+        python3 -m pip install --quiet twine
+        python3 -m twine upload python/dist/*.whl
