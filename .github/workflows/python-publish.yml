@@ -1,0 +1,45 @@
+# Publishes the Python wheel to PyPI and attaches build artifacts to the
+# GitHub release. Same trigger/secret pattern as py-svg-chart, but the wheel
+# bundles a Metal dylib so it must build on an Apple-silicon macOS runner.
+#
+# Release flow (see RELEASING.md):
+#   bump2version patch && git push && git push --tags
+#   then publish a GitHub Release for the new vX.Y.Z tag.
+
+name: Upload Python Package
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write   # upload release assets
+
+jobs:
+  deploy:
+    runs-on: macos-15
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+    - name: Build and test Swift core
+      run: |
+        swift build -c release
+        swift test
+    - name: Build wheel
+      run: ./scripts/build_wheel.sh
+    - name: Attach artifacts to the release
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        gh release upload "$GITHUB_REF_NAME" python/dist/*.whl \
+            .build/release/macboost --clobber
+    - name: Publish package
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        user: __token__
+        password: ${{ secrets.PYPI_API_TOKEN }}
+        packages-dir: python/dist

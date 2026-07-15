@@ -1,0 +1,12 @@
+.build/
+.swiftpm/
+export*/
+__pycache__/
+*.egg-info/
+python/macboost/libmacboostc.dylib
+macboost_model.json
+predictions.csv
+.DS_Store
+higgs-cache/
+python/dist/
+python/build/
