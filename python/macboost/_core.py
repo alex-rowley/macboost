@@ -26,41 +26,67 @@ def _find_library() -> str:
     )
 
 
-_lib = ctypes.CDLL(_find_library())
-
 _c_char_pp = ctypes.POINTER(ctypes.c_char_p)
 _f32_p = ctypes.POINTER(ctypes.c_float)
 
-_lib.macboost_train.restype = ctypes.c_void_p
-_lib.macboost_train.argtypes = [
-    ctypes.c_char_p, _f32_p, ctypes.c_int64, ctypes.c_int64, _f32_p, _f32_p,
-    _f32_p, ctypes.c_int64, _f32_p, _c_char_pp,
-]
-_lib.macboost_predict_contrib.restype = ctypes.c_int32
-_lib.macboost_predict_contrib.argtypes = [
-    ctypes.c_void_p, _f32_p, ctypes.c_int64, ctypes.c_int64, _f32_p, _c_char_pp,
-]
-_lib.macboost_feature_importance.restype = ctypes.c_int32
-_lib.macboost_feature_importance.argtypes = [ctypes.c_void_p, ctypes.c_int32, _f32_p]
-_lib.macboost_predict.restype = ctypes.c_int32
-_lib.macboost_predict.argtypes = [
-    ctypes.c_void_p, _f32_p, ctypes.c_int64, ctypes.c_int64, _f32_p, _c_char_pp,
-]
-_lib.macboost_save.restype = ctypes.c_int32
-_lib.macboost_save.argtypes = [ctypes.c_void_p, ctypes.c_char_p, _c_char_pp]
-_lib.macboost_load.restype = ctypes.c_void_p
-_lib.macboost_load.argtypes = [ctypes.c_char_p, _c_char_pp]
-for name in ("macboost_num_trees", "macboost_num_features", "macboost_best_iteration",
-             "macboost_num_classes"):
-    fn = getattr(_lib, name)
-    fn.restype = ctypes.c_int64
-    fn.argtypes = [ctypes.c_void_p]
-_lib.macboost_warnings.restype = ctypes.c_void_p   # char* we must free ourselves
-_lib.macboost_warnings.argtypes = [ctypes.c_void_p]
-_lib.macboost_free.restype = None
-_lib.macboost_free.argtypes = [ctypes.c_void_p]
-_lib.macboost_free_string.restype = None
-_lib.macboost_free_string.argtypes = [ctypes.c_char_p]
+_lib_instance = None
+
+
+class _LazyLib:
+    """Defers dylib loading so `import macboost` works on any platform;
+    only training/native inference require the Metal core."""
+
+    def __getattr__(self, name):
+        global _lib_instance
+        if _lib_instance is None:
+            if os.environ.get("MACBOOST_FORCE_PYTHON"):
+                raise OSError("MACBOOST_FORCE_PYTHON is set")
+            _lib_instance = ctypes.CDLL(_find_library())
+            _configure(_lib_instance)
+        return getattr(_lib_instance, name)
+
+
+def native_available() -> bool:
+    try:
+        _lib.macboost_num_trees   # noqa: B018 — probe the load
+        return True
+    except OSError:
+        return False
+
+
+_lib = _LazyLib()
+
+def _configure(_lib):
+    _lib.macboost_train.restype = ctypes.c_void_p
+    _lib.macboost_train.argtypes = [
+        ctypes.c_char_p, _f32_p, ctypes.c_int64, ctypes.c_int64, _f32_p, _f32_p,
+        _f32_p, ctypes.c_int64, _f32_p, _c_char_pp,
+    ]
+    _lib.macboost_predict_contrib.restype = ctypes.c_int32
+    _lib.macboost_predict_contrib.argtypes = [
+        ctypes.c_void_p, _f32_p, ctypes.c_int64, ctypes.c_int64, _f32_p, _c_char_pp,
+    ]
+    _lib.macboost_feature_importance.restype = ctypes.c_int32
+    _lib.macboost_feature_importance.argtypes = [ctypes.c_void_p, ctypes.c_int32, _f32_p]
+    _lib.macboost_predict.restype = ctypes.c_int32
+    _lib.macboost_predict.argtypes = [
+        ctypes.c_void_p, _f32_p, ctypes.c_int64, ctypes.c_int64, _f32_p, _c_char_pp,
+    ]
+    _lib.macboost_save.restype = ctypes.c_int32
+    _lib.macboost_save.argtypes = [ctypes.c_void_p, ctypes.c_char_p, _c_char_pp]
+    _lib.macboost_load.restype = ctypes.c_void_p
+    _lib.macboost_load.argtypes = [ctypes.c_char_p, _c_char_pp]
+    for name in ("macboost_num_trees", "macboost_num_features", "macboost_best_iteration",
+                 "macboost_num_classes"):
+        fn = getattr(_lib, name)
+        fn.restype = ctypes.c_int64
+        fn.argtypes = [ctypes.c_void_p]
+    _lib.macboost_warnings.restype = ctypes.c_void_p   # char* we must free ourselves
+    _lib.macboost_warnings.argtypes = [ctypes.c_void_p]
+    _lib.macboost_free.restype = None
+    _lib.macboost_free.argtypes = [ctypes.c_void_p]
+    _lib.macboost_free_string.restype = None
+    _lib.macboost_free_string.argtypes = [ctypes.c_char_p]
 
 
 class MacBoostError(RuntimeError):

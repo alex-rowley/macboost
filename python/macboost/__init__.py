@@ -166,6 +166,11 @@ class _BaseBooster:
 
     def fit(self, X, y, eval_set=None, early_stopping_rounds=None, eval_every=0,
             sample_weight=None, init_model=None):
+        if not _core.native_available():
+            raise MacBoostError(
+                "training requires the native Metal core (Apple silicon, "
+                "macOS 15+). This install supports inference only — use "
+                "load_model() to score models trained on a Mac.")
         """Train. X: (n, f) array; NaN marks missing values. Columns listed
         in categorical_features must hold integer category ids.
 
@@ -211,6 +216,8 @@ class _BaseBooster:
         return self
 
     def _raw_predict(self, X):
+        if getattr(self, "_pymodel", None) is not None:
+            return self._pymodel.predict_raw(np.asarray(X, dtype=np.float32))
         if self._handle is None:
             raise MacBoostError("model is not fitted; call fit() or load_model()")
         return _core.predict(self._handle, X)
@@ -222,6 +229,9 @@ class _BaseBooster:
         return y
 
     def feature_importance(self, importance_type=None):
+        if getattr(self, "_pymodel", None) is not None:
+            return self._pymodel.feature_importance(
+                importance_type or self.importance_type)
         if self._handle is None:
             raise MacBoostError("model is not fitted")
         return _core.feature_importance(
@@ -234,11 +244,30 @@ class _BaseBooster:
     def predict_contrib(self, X):
         """SHAP contributions, rows x (n_features + 1); the last column is
         the expected value. Rows sum to the raw prediction."""
+        if getattr(self, "_pymodel", None) is not None:
+            raise MacBoostError(
+                "predict_contrib requires the native core; export the model "
+                "or score contributions on a Mac")
         if self._handle is None:
             raise MacBoostError("model is not fitted")
         return _core.predict_contrib(self._handle, X)
 
+    def save_xgboost(self, path):
+        """Export as an XGBoost JSON model for deployment anywhere xgboost
+        runs (identical predictions; categorical splits are expanded into
+        equivalent numeric chains)."""
+        from . import export
+        export.save_xgboost(self, path)
+
+    def save_onnx(self, path):
+        """Export as an ONNX model (ai.onnx.ml TreeEnsemble) scoreable by
+        onnxruntime on any platform. Requires the `onnx` package."""
+        from . import export
+        export.save_onnx(self, path)
+
     def save_model(self, path):
+        if getattr(self, "_pymodel", None) is not None:
+            return self._pymodel.save(path)
         if self._handle is None:
             raise MacBoostError("model is not fitted")
         _core.save(self._handle, path)
@@ -246,15 +275,24 @@ class _BaseBooster:
     @classmethod
     def load_model(cls, path):
         model = cls()
-        model._handle = _core.load(path)
+        if _core.native_available():
+            model._handle = _core.load(path)
+        else:
+            # Pure-Python inference backend: works on any platform.
+            from ._pyinfer import PyModel
+            model._pymodel = PyModel(path)
         return model
 
     @property
     def n_trees_(self):
+        if getattr(self, "_pymodel", None) is not None:
+            return self._pymodel.num_trees
         return _core.num_trees(self._handle) if self._handle else 0
 
     @property
     def n_features_in_(self):
+        if getattr(self, "_pymodel", None) is not None:
+            return self._pymodel.num_features
         return _core.num_features(self._handle) if self._handle else 0
 
     # Back-compat spelling.
@@ -271,6 +309,8 @@ class MacBoostRegressor(_SkRegressor, _BaseBooster, _SkBase):
     _estimator_type = "regressor"
 
     def predict(self, X):
+        if getattr(self, "_pymodel", None) is not None:
+            return self._pymodel.predict(np.asarray(X, dtype=np.float32))
         return self._raw_predict(X)
 
     def score(self, X, y):

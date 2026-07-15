@@ -1,12 +1,14 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["numpy", "scikit-learn"]
+# dependencies = ["numpy", "scikit-learn", "xgboost", "onnx", "onnxruntime"]
 # ///
 """Python binding tests: regression, classification, missing values,
 categoricals, early stopping, and save/load prediction parity.
 
 Run from the repo root:  uv run scripts/test_python.py
 (builds are expected at .build/release; run `swift build -c release` first)
+Needs an arm64 interpreter — if uv defaults to an x86_64 Python, pass
+`--python cpython-3.13-macos-aarch64-none`.
 """
 import math
 import sys
@@ -179,6 +181,146 @@ with warnings.catch_warnings(record=True) as caught:
     MacBoostRegressor(n_estimators=5).fit(Xg, yg)
 check(not caught, "clean data trains without warnings")
 
+
+print("pure-python inference backend (Linux deploy path)")
+import os
+import subprocess, tempfile as _tf
+with _tf.TemporaryDirectory() as _tmp:
+    # Model exercising NaN + categorical + missing-direction routing.
+    Xd = Xm.copy()
+    md = MacBoostRegressor(n_estimators=60, max_depth=6, categorical_features=[10])
+    md.fit(Xd, ym)
+    md.save_model(f"{_tmp}/m.json")
+    native_pred = md.predict(Xd[:5000])
+    np.save(f"{_tmp}/X.npy", Xd[:5000]); np.save(f"{_tmp}/p.npy", native_pred)
+    code = (
+        "import os, numpy as np\n"
+        "import macboost\n"
+        "from macboost import MacBoostRegressor\n"
+        "from macboost import _core\n"
+        "assert not _core.native_available(), 'native lib should be disabled'\n"
+        f"m = MacBoostRegressor.load_model('{_tmp}/m.json')\n"
+        f"X = np.load('{_tmp}/X.npy'); ref = np.load('{_tmp}/p.npy')\n"
+        "pred = m.predict(X)\n"
+        "assert np.allclose(pred, ref, atol=2e-4), float(np.abs(pred-ref).max())\n"
+        "assert m.n_trees_ == 60 and m.n_features_in_ == 11\n"
+        "imp = m.feature_importances_\n"
+        "assert imp.shape == (11,) and imp.sum() > 0\n"
+        "try:\n"
+        "    m.fit(X, ref)\n"
+        "    raise SystemExit('fit should fail without native core')\n"
+        "except Exception as e:\n"
+        "    assert 'Apple silicon' in str(e), e\n"
+        "print('PYBACKEND-OK')\n"
+    )
+    env = dict(os.environ, MACBOOST_FORCE_PYTHON="1",
+               PYTHONPATH=str(Path(__file__).resolve().parent.parent / "python"))
+    r = subprocess.run([sys.executable, "-c", code], env=env,
+                       capture_output=True, text=True)
+    check("PYBACKEND-OK" in r.stdout,
+          f"python-only backend matches native predictions (stderr: {r.stderr[-300:] if r.returncode else 'clean'})")
+
+    # Multiclass through the python backend too.
+    _X3 = rng.random((6_000, 4), dtype=np.float32)
+    _y3 = np.minimum(2, (_X3[:, 0] * 3).astype(int)).astype(np.float32)
+    mm = MacBoostClassifier(n_estimators=20, max_depth=4).fit(_X3, _y3)
+    mm.save_model(f"{_tmp}/mc.json")
+    ref3 = mm._raw_predict(_X3[:2000])
+    np.save(f"{_tmp}/X3.npy", _X3[:2000]); np.save(f"{_tmp}/p3.npy", ref3)
+    code = (
+        "import numpy as np\n"
+        "from macboost._pyinfer import PyModel\n"
+        f"m = PyModel('{_tmp}/mc.json')\n"
+        f"X = np.load('{_tmp}/X3.npy'); ref = np.load('{_tmp}/p3.npy')\n"
+        "pred = m.predict_raw(X)\n"
+        "assert pred.shape == ref.shape\n"
+        "assert np.allclose(pred, ref, atol=2e-4), float(np.abs(pred-ref).max())\n"
+        "print('PYBACKEND-MC-OK')\n"
+    )
+    r = subprocess.run([sys.executable, "-c", code], env=env,
+                       capture_output=True, text=True)
+    check("PYBACKEND-MC-OK" in r.stdout,
+          f"python backend multiclass raw scores match (stderr: {r.stderr[-300:] if r.returncode else 'clean'})")
+
+print("xgboost export parity")
+import xgboost as _xgb
+with _tf.TemporaryDirectory() as _tmp:
+    # Regression with NaN + categorical.
+    md2 = MacBoostRegressor(n_estimators=50, max_depth=6, categorical_features=[10])
+    md2.fit(Xm, ym)
+    md2.save_xgboost(f"{_tmp}/m.xgb.json")
+    bst = _xgb.Booster()
+    bst.load_model(f"{_tmp}/m.xgb.json")
+    Xt = Xm[:5000]
+    ours = md2.predict(Xt)
+    theirs = bst.predict(_xgb.DMatrix(Xt), output_margin=True)
+    gap = float(np.abs(ours - theirs).max())
+    check(gap < 3e-4, f"xgboost regression margins match (max gap {gap:.2e}, NaN+cat data)")
+
+    # Binary logistic: compare probabilities.
+    clf2 = MacBoostClassifier(n_estimators=40, max_depth=5).fit(Xb, yb)
+    clf2.save_xgboost(f"{_tmp}/b.xgb.json")
+    bstb = _xgb.Booster(); bstb.load_model(f"{_tmp}/b.xgb.json")
+    p_ours = clf2.predict_proba(Xb[:5000])[:, 1]
+    p_theirs = bstb.predict(_xgb.DMatrix(Xb[:5000]))
+    gap = float(np.abs(p_ours - p_theirs).max())
+    check(gap < 3e-4, f"xgboost binary probabilities match (max gap {gap:.2e})")
+
+    # Poisson: exp transform on both sides.
+    ypois2 = rng.poisson(np.exp(1 + Xg[:, 0])).astype(np.float32)
+    pois2 = MacBoostRegressor(n_estimators=40, objective="poisson").fit(Xg, ypois2)
+    pois2.save_xgboost(f"{_tmp}/p.xgb.json")
+    bstp = _xgb.Booster(); bstp.load_model(f"{_tmp}/p.xgb.json")
+    mu_ours = pois2.predict(Xg[:2000])
+    mu_theirs = bstp.predict(_xgb.DMatrix(Xg[:2000]))
+    rel = float(np.abs(mu_ours - mu_theirs).max() / mu_ours.max())
+    check(rel < 1e-3, f"xgboost poisson means match (max rel gap {rel:.2e})")
+
+    # Multiclass softprob.
+    _X4 = rng.random((6_000, 4), dtype=np.float32)
+    _y4 = np.minimum(2, (_X4[:, 0] * 3).astype(int)).astype(np.float32)
+    mc2 = MacBoostClassifier(n_estimators=25, max_depth=4).fit(_X4, _y4)
+    mc2.save_xgboost(f"{_tmp}/mc.xgb.json")
+    bstm = _xgb.Booster(); bstm.load_model(f"{_tmp}/mc.xgb.json")
+    pr_ours = mc2.predict_proba(_X4[:2000])
+    pr_theirs = bstm.predict(_xgb.DMatrix(_X4[:2000]))
+    gap = float(np.abs(pr_ours - pr_theirs).max())
+    check(gap < 3e-4, f"xgboost multiclass probabilities match (max gap {gap:.2e})")
+
+print("onnx export parity")
+import onnxruntime as _ort
+with _tf.TemporaryDirectory() as _tmp:
+    def _ort_predict(path, Xq):
+        sess = _ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+        return sess.run(["prediction"], {"input": Xq.astype(np.float32)})[0]
+
+    # Regression with NaN + categorical (reusing md2 from the xgboost tests).
+    md2.save_onnx(f"{_tmp}/m.onnx")
+    ours = md2.predict(Xm[:5000])
+    theirs = _ort_predict(f"{_tmp}/m.onnx", Xm[:5000]).ravel()
+    gap = float(np.abs(ours - theirs).max())
+    check(gap < 3e-4, f"onnx regression predictions match (max gap {gap:.2e}, NaN+cat data)")
+
+    # Binary logistic probabilities.
+    clf2.save_onnx(f"{_tmp}/b.onnx")
+    p_ours = clf2.predict_proba(Xb[:5000])[:, 1]
+    p_theirs = _ort_predict(f"{_tmp}/b.onnx", Xb[:5000]).ravel()
+    gap = float(np.abs(p_ours - p_theirs).max())
+    check(gap < 3e-4, f"onnx binary probabilities match (max gap {gap:.2e})")
+
+    # Poisson means (Exp node appended).
+    pois2.save_onnx(f"{_tmp}/p.onnx")
+    mu_ours = pois2.predict(Xg[:2000])
+    mu_theirs = _ort_predict(f"{_tmp}/p.onnx", Xg[:2000]).ravel()
+    rel = float(np.abs(mu_ours - mu_theirs).max() / mu_ours.max())
+    check(rel < 1e-3, f"onnx poisson means match (max rel gap {rel:.2e})")
+
+    # Multiclass probabilities (Softmax node appended).
+    mc2.save_onnx(f"{_tmp}/mc.onnx")
+    pr_ours = mc2.predict_proba(_X4[:2000])
+    pr_theirs = _ort_predict(f"{_tmp}/mc.onnx", _X4[:2000])
+    gap = float(np.abs(pr_ours - pr_theirs).max())
+    check(gap < 3e-4, f"onnx multiclass probabilities match (max gap {gap:.2e})")
 
 print("tier 1+2 features")
 # Multiclass with arbitrary label values (auto-encoded).

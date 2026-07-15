@@ -86,16 +86,15 @@ the gap further because subset-split search is nearly free in-kernel.
 
 ## Install
 
-Requires an Apple-silicon Mac on macOS 15+.
+Training requires an Apple-silicon Mac on macOS 15+. The wheel itself
+installs on any platform — on Linux you get inference and model export,
+not training (see [Deployment](#deployment)).
 
 **Python** — a prebuilt wheel, no compiler or toolchain needed:
 
 ```sh
 pip install macboost
 ```
-
-(Until the first PyPI release lands: grab the `.whl` from the GitHub
-Releases page and `pip install` it directly.)
 
 **CLI** — download the `macboost` binary from GitHub Releases
 (`curl -LO`, not the browser, to avoid the quarantine prompt), or build
@@ -215,6 +214,48 @@ try booster.save(to: url)
 ```
 
 The library target has zero dependencies beyond Apple's OS frameworks.
+
+## Deployment
+
+Models train on a Mac; they usually ship to Linux. Three paths, all
+producing identical predictions (verified in the test suite):
+
+**1. `pip install macboost` on the server.** The wheel installs anywhere.
+Off Apple silicon there is no Metal core, so training raises, but
+`load_model` falls back to a pure-numpy scorer with the same semantics —
+NaN routing, categorical splits, objective transforms:
+
+```python
+model = MacBoostRegressor.load_model("model.json")   # works on Linux
+preds = model.predict(X)
+```
+
+Simplest path; fine for batch scoring. It is numpy-speed, not
+XGBoost-speed — for latency-critical serving use one of the exports.
+
+**2. XGBoost export.** Emit a standard XGBoost JSON model and serve it
+with vanilla `xgboost` (or anything that loads one — e.g. Triton FIL):
+
+```python
+model.save_xgboost("model.xgb.json")
+# elsewhere: bst = xgb.Booster(); bst.load_model("model.xgb.json")
+```
+
+Categorical splits have no XGBoost equivalent, so they are rewritten into
+equivalent numeric-split chains — predictions match to float32 epsilon,
+but exported trees are larger and per-tree introspection won't mirror the
+original.
+
+**3. ONNX export.** Emit an `ai.onnx.ml` TreeEnsemble for onnxruntime
+(requires the `onnx` package to export, only onnxruntime to serve):
+
+```python
+model.save_onnx("model.onnx")
+# elsewhere: ort.InferenceSession("model.onnx").run(["prediction"], {"input": X})
+```
+
+The graph outputs what `predict` returns: probabilities for classifiers,
+means for poisson/tweedie, raw scores for regression.
 
 ## Guardrails
 

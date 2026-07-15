@@ -1,5 +1,8 @@
 #!/bin/bash
-# Build the platform-tagged Python wheel (bundles the Metal dylib).
+# Build the Python wheel. Bundles the Metal dylib but keeps the default
+# py3-none-any tag: training/native inference needs the dylib (Apple
+# silicon), while pure-Python inference and the export tools work anywhere,
+# so the wheel must be installable on Linux too.
 # Uses uv when available (local dev), pip otherwise (CI with setup-python).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -9,10 +12,8 @@ cd python
 rm -rf dist build ./*.egg-info
 if command -v uv >/dev/null 2>&1; then
   uv build --wheel --out-dir dist .
-  uvx --from wheel wheel tags --platform-tag macosx_15_0_arm64 --remove dist/*.whl
 else
-  python3 -m pip install --quiet --upgrade build wheel
+  python3 -m pip install --quiet --upgrade build
   python3 -m build --wheel --outdir dist .
-  python3 -m wheel tags --platform-tag macosx_15_0_arm64 --remove dist/*.whl
 fi
 ls -la dist/
