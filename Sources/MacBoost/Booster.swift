@@ -197,7 +197,7 @@ public final class MacBooster {
     /// Number of classes the model was trained with (1 unless multiclass).
     public internal(set) var trainedNumClasses = 1
 
-    private let engine: MetalEngine
+    let engine: MetalEngine
 
     public init(params: BoosterParams) throws {
         guard params.numBins >= 4 && params.numBins <= 256 else {
@@ -1352,13 +1352,13 @@ public final class MacBooster {
 
     // MARK: - Inference
 
-    private struct ForestBuffers {
+    struct ForestBuffers {
         let feats: MTLBuffer; let thresholds: MTLBuffer; let flags: MTLBuffer
         let leaves: MTLBuffer; let masks: MTLBuffer; let nodesPerTree: Int
     }
     private var forestCache: ForestBuffers?
 
-    private func forestBuffers() -> ForestBuffers {
+    func forestBuffers() -> ForestBuffers {
         if let c = forestCache { return c }
         let nodes = trees.map { $0.feature.count }.max()!
         var feats = [Int32](); feats.reserveCapacity(trees.count * nodes)

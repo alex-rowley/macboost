@@ -1,8 +1,12 @@
 import Foundation
+import Metal
 
 // TreeSHAP (Lundberg & Lee): exact Shapley value feature contributions for
 // tree ensembles, using each node's training cover as the background
-// distribution. CPU implementation, parallel over rows.
+// distribution. Large batches run on the GPU via path decomposition (one
+// thread per row x leaf path, GPUTreeSHAP-style); small ones on a CPU
+// implementation parallel over rows. Both produce the same values (the GPU
+// accumulates in float32, so equality is to float precision, not bitwise).
 
 private struct PathElement {
     var featureIndex: Int
@@ -10,6 +14,25 @@ private struct PathElement {
     var oneFraction: Double
     var pweight: Double
 }
+
+// Must match the MSL ShapElement layout (5 x 4 bytes).
+private struct ShapElementHost {
+    var feature: UInt32
+    var zeroFraction: Float
+    var threshold: Float
+    var flags: UInt32          // FLAG_* bits; bit 8 = path continues LEFT
+    var nodeGlobal: UInt32     // tree*nodesPerTree + node (catMask lookup)
+}
+
+private struct ShapParamsHost {
+    var totalRows: UInt32; var rowCount: UInt32; var rowOffset: UInt32
+    var numPaths: UInt32; var numClasses: UInt32; var numFeatures: UInt32
+    var dataBins: UInt32
+}
+
+private let shapChildLeft: UInt32 = 0x100
+private let shapMaxPathLen = 13        // must match SHAP_MAX_PATH in MSL
+private let shapGPUMinRows = 256
 
 extension MacBooster {
 
@@ -20,16 +43,21 @@ extension MacBooster {
     public func predictContributions(featureMajor X: [Float], rows: Int,
                                      cols: Int) -> [Float] {
         precondition(cols == numFeatures)
-        let K = trainedNumClasses
-        let width = cols + 1
-        var out = [Float](repeating: 0, count: rows * K * width)
-        let localTrees = trees
-        let dataBins = trainedNumBins - 1
+        if rows >= shapGPUMinRows, !trees.isEmpty,
+           let out = predictContributionsGPU(featureMajor: X, rows: rows,
+                                             cols: cols) {
+            return out
+        }
+        return predictContributionsCPU(featureMajor: X, rows: rows, cols: cols)
+    }
 
-        // Expected value per class (base + cover-weighted tree means).
+    /// Expected raw score per class: base score + cover-weighted tree means.
+    /// This is the trailing bias column of the contributions output.
+    private func shapBias() -> [Double] {
+        let K = trainedNumClasses
         var bias = [Double](repeating: 0, count: K)
         for k in 0..<K { bias[k] = Double(baseScores[k]) }
-        for (t, tree) in localTrees.enumerated() {
+        for (t, tree) in trees.enumerated() {
             var mean = 0.0
             var stack = [0]
             let total = Double(tree.cover.first ?? 0)
@@ -40,6 +68,113 @@ extension MacBooster {
             }
             bias[t % K] += mean
         }
+        return bias
+    }
+
+    // MARK: - GPU path
+
+    /// Decompose the forest into root-to-leaf paths for the gpu_treeshap
+    /// kernel. Returns nil when the model can't run on the GPU path (no
+    /// covers stored, or a path deeper than the kernel's register arrays).
+    private func extractShapPaths(nodesPerTree: Int)
+        -> (elements: [ShapElementHost], starts: [UInt32],
+            leaves: [Float], classes: [UInt32])? {
+        let K = trainedNumClasses
+        var elements: [ShapElementHost] = []
+        var starts: [UInt32] = [0]
+        var leaves: [Float] = []
+        var classes: [UInt32] = []
+        for (t, tree) in trees.enumerated() {
+            guard tree.cover.count == tree.feature.count,
+                  tree.cover[0] > 0 else { return nil }
+            var stack: [(node: Int, path: [ShapElementHost])] = [(0, [])]
+            while let (n, path) = stack.popLast() {
+                if tree.feature[n] < 0 {
+                    if path.isEmpty { continue }     // root-is-leaf: bias only
+                    elements.append(contentsOf: path)
+                    starts.append(UInt32(elements.count))
+                    leaves.append(tree.leaf[n])
+                    classes.append(UInt32(t % K))
+                    continue
+                }
+                if path.count + 1 > shapMaxPathLen - 1 { return nil }
+                let coverN = tree.cover[n]
+                for (child, isLeft) in [(2 * n + 1, true), (2 * n + 2, false)] {
+                    let el = ShapElementHost(
+                        feature: UInt32(tree.feature[n]),
+                        zeroFraction: coverN > 0 ? tree.cover[child] / coverN : 0,
+                        threshold: tree.threshold[n],
+                        flags: UInt32(tree.flags[n]) | (isLeft ? shapChildLeft : 0),
+                        nodeGlobal: UInt32(t * nodesPerTree + n))
+                    stack.append((child, path + [el]))
+                }
+            }
+        }
+        return elements.isEmpty ? nil : (elements, starts, leaves, classes)
+    }
+
+    private func predictContributionsGPU(featureMajor X: [Float], rows: Int,
+                                         cols: Int) -> [Float]? {
+        let forest = forestBuffers()
+        guard let paths = extractShapPaths(nodesPerTree: forest.nodesPerTree)
+        else { return nil }
+        let K = trainedNumClasses
+        let width = cols + 1
+        let numPaths = paths.leaves.count
+        let outLength = rows * K * width * 4
+
+        let xBuf = engine.makeBuffer(X)
+        let elBuf = engine.makeBuffer(paths.elements)
+        let stBuf = engine.makeBuffer(paths.starts)
+        let lfBuf = engine.makeBuffer(paths.leaves)
+        let clBuf = engine.makeBuffer(paths.classes)
+        let outBuf = engine.makeBuffer(length: outLength)
+
+        // Bound each dispatch to ~2^28 row-path threads so a huge request
+        // becomes several short command buffers instead of one long one.
+        let chunk = max(1, min(rows, (1 << 28) / max(numPaths, 1)))
+        var offset = 0
+        while offset < rows {
+            let count = min(chunk, rows - offset)
+            let cb = engine.queue.makeCommandBuffer()!
+            if offset == 0 { engine.fillZero(cb, outBuf, length: outLength) }
+            engine.dispatch(cb, "gpu_treeshap",
+                            buffers: [xBuf, elBuf, stBuf, lfBuf, clBuf,
+                                      forest.masks, outBuf],
+                            params: ShapParamsHost(
+                                totalRows: UInt32(rows), rowCount: UInt32(count),
+                                rowOffset: UInt32(offset),
+                                numPaths: UInt32(numPaths),
+                                numClasses: UInt32(K), numFeatures: UInt32(cols),
+                                dataBins: UInt32(trainedNumBins - 1)),
+                            grid: MTLSize(width: count, height: numPaths, depth: 1),
+                            threadgroup: MTLSize(width: 64, height: 4, depth: 1))
+            cb.commit()
+            cb.waitUntilCompleted()
+            offset += count
+        }
+
+        var out = [Float](UnsafeBufferPointer(
+            start: outBuf.contents().bindMemory(to: Float.self,
+                                                capacity: rows * K * width),
+            count: rows * K * width))
+        let bias = shapBias()
+        for i in 0..<rows {
+            for k in 0..<K { out[i * K * width + k * width + cols] = Float(bias[k]) }
+        }
+        return out
+    }
+
+    // MARK: - CPU path
+
+    func predictContributionsCPU(featureMajor X: [Float], rows: Int,
+                                 cols: Int) -> [Float] {
+        let K = trainedNumClasses
+        let width = cols + 1
+        var out = [Float](repeating: 0, count: rows * K * width)
+        let localTrees = trees
+        let dataBins = trainedNumBins - 1
+        let bias = shapBias()
 
         let chunk = 512
         let nChunks = (rows + chunk - 1) / chunk

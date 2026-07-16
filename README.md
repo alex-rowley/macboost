@@ -28,8 +28,9 @@ classification on dense data:**
 - **Sampling**: GOSS (LightGBM's algorithm incl. its warm-up), bagging
   (`subsample`), column sampling (`colsample_bytree`)
 - **Constraints & interpretability**: monotone constraints with hard
-  bounds-propagated guarantees, gain/split feature importance, TreeSHAP
-  contributions (incl. multiclass), calibrated L1/quantile leaves
+  bounds-propagated guarantees, gain/split feature importance, GPU
+  TreeSHAP contributions (incl. multiclass; ~50M row·trees/s — 200k rows
+  × 100 trees explained in 0.4s), calibrated L1/quantile leaves
 - **Workflow**: early stopping with per-iteration GPU validation eval,
   metric overrides incl. AUC, warm starts (`init_model`), JSON model
   save/load, GPU batch inference (bit-identical to the CPU path)
@@ -296,6 +297,13 @@ The hot loop is tuned for Apple-silicon memory bandwidth:
   serialising on a handful of atomics.
 - Everything lives in `storageModeShared` unified memory — model readback,
   validation metrics, and dataset loading never copy across a bus.
+
+Inference and SHAP run on the GPU too: batch prediction walks the
+flattened forest over raw values (bit-identical to the CPU path), and
+`predict_contrib` uses GPUTreeSHAP-style path decomposition — one thread
+per (row, leaf path), duplicate features merged multiplicatively, the
+whole Shapley weight computation in registers — for ~40× the parallel CPU
+implementation, which remains as the small-batch path and reference.
 
 Missing values get a reserved bin and the split search tries them on both
 sides (learned default direction). Categorical features use LightGBM's

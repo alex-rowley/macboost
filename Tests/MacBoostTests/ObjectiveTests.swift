@@ -434,6 +434,49 @@ extension ObjectiveTests {
                              "the categorical signal must out-attribute noise")
     }
 
+    /// The GPU TreeSHAP kernel must reproduce the CPU reference
+    /// implementation (float32 vs double accumulation, hence tolerance).
+    /// Data covers NaN routing and categorical splits.
+    func testGPUSHAPMatchesCPU() throws {
+        let rows = 3_000, cols = 7
+        var (X, y) = DataGen.friedman(rows: rows, cols: 6, seed: 211)
+        var rng = SplitMix64(seed: 212)
+        for i in 0..<rows where rng.uniform() < 0.15 { X[rows + i] = .nan }
+        X.append(contentsOf: (0..<rows).map { _ in Float(rng.next() % 5) })
+        for i in 0..<rows { y[i] += X[6 * rows + i] == 2 ? 3 : 0 }
+
+        var p = BoosterParams()
+        p.numTrees = 40; p.maxDepth = 6; p.categoricalFeatures = [6]
+        let b = try MacBooster(params: p)
+        try b.fit(featureMajor: X, rows: rows, cols: cols, labels: y)
+
+        let gpu = b.predictContributions(featureMajor: X, rows: rows, cols: cols)
+        let cpu = b.predictContributionsCPU(featureMajor: X, rows: rows, cols: cols)
+        XCTAssertEqual(gpu.count, cpu.count)
+        var worst: Float = 0
+        for i in 0..<gpu.count { worst = max(worst, abs(gpu[i] - cpu[i])) }
+        XCTAssertLessThan(worst, 5e-3,
+                          "GPU contributions must match CPU TreeSHAP (worst gap \(worst))")
+    }
+
+    /// Same parity at the depth cap, where the kernel's register arrays
+    /// and the duplicate-feature merging are exercised hardest.
+    func testGPUSHAPMatchesCPUDeepTrees() throws {
+        let rows = 1_000, cols = 5
+        let (X, y) = DataGen.friedman(rows: rows, cols: cols, seed: 221)
+        var p = BoosterParams()
+        p.numTrees = 8; p.maxDepth = 12; p.minChildHess = 1
+        let b = try MacBooster(params: p)
+        try b.fit(featureMajor: X, rows: rows, cols: cols, labels: y)
+
+        let gpu = b.predictContributions(featureMajor: X, rows: rows, cols: cols)
+        let cpu = b.predictContributionsCPU(featureMajor: X, rows: rows, cols: cols)
+        var worst: Float = 0
+        for i in 0..<gpu.count { worst = max(worst, abs(gpu[i] - cpu[i])) }
+        XCTAssertLessThan(worst, 5e-3,
+                          "depth-12 GPU contributions must match CPU (worst gap \(worst))")
+    }
+
     /// Multiclass SHAP: per-class blocks sum to the class's raw score.
     func testMulticlassSHAP() throws {
         let rows = 800, cols = 4, K = 3
@@ -460,6 +503,13 @@ extension ObjectiveTests {
         }
         XCTAssertLessThan(worst, 2e-2,
                           "per-class contributions must sum to the class score (worst \(worst))")
+
+        // And the GPU path must agree with the CPU reference per class.
+        let cpu = b.predictContributionsCPU(featureMajor: X, rows: rows, cols: cols)
+        var gap: Float = 0
+        for i in 0..<contrib.count { gap = max(gap, abs(contrib[i] - cpu[i])) }
+        XCTAssertLessThan(gap, 5e-3,
+                          "multiclass GPU contributions must match CPU (worst \(gap))")
     }
 }
 

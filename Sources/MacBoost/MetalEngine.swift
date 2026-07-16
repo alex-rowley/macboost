@@ -33,7 +33,7 @@ final class MetalEngine {
         "bin_data", "compute_gradients", "compute_gradients_multiclass", "quantize_gradients", "iota",
         "build_histograms", "subtract_histograms", "find_splits",
         "init_tree", "decide_splits", "final_leaves",
-        "route_samples", "predict_tree_binned", "predict_forest", "copy_cover", "assign_leaves", "debug_bounds",
+        "route_samples", "predict_tree_binned", "predict_forest", "gpu_treeshap", "copy_cover", "assign_leaves", "debug_bounds",
         "goss_grad_hist", "goss_threshold", "goss_select", "goss_finalize",
     ]
 

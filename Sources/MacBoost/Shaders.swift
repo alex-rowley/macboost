@@ -917,6 +917,109 @@ kernel void predict_forest(
     }
 }
 
+// One root-to-leaf path split, precomputed on the host (GPUTreeSHAP-style
+// path decomposition: the recursive TreeSHAP sum distributes over leaves).
+struct ShapElement {
+    uint  feature;
+    float zeroFraction;   // cover(child)/cover(parent) along the path
+    float threshold;
+    uint  flags;          // FLAG_* bits; bit 8 = path continues to LEFT child
+    uint  nodeGlobal;     // tree*nodesPerTree + node, for catMask lookup
+};
+#define SHAP_CHILD_LEFT 0x100u
+
+struct ShapParams {
+    uint totalRows; uint rowCount; uint rowOffset;
+    uint numPaths; uint numClasses; uint numFeatures; uint dataBins;
+};
+
+// Exact TreeSHAP, one thread per (row, leaf path). Duplicate features on a
+// path are merged multiplicatively up front — EXTEND is commutative
+// polynomial multiplication, so pre-merging equals the recursive
+// algorithm's unwind/re-extend. Path length <= 12 (maxDepth cap), so the
+// whole computation fits in registers; contributions land in the output
+// via float atomics.
+#define SHAP_MAX_PATH 13
+kernel void gpu_treeshap(
+    device const float       *X         [[buffer(0)]],   // feature-major raw
+    device const ShapElement *elements  [[buffer(1)]],
+    device const uint        *pathStart [[buffer(2)]],   // numPaths + 1
+    device const float       *pathLeaf  [[buffer(3)]],
+    device const uint        *pathClass [[buffer(4)]],
+    device const uint        *masks     [[buffer(5)]],   // per node 8 words
+    device atomic_float      *out       [[buffer(6)]],   // rows*K*(F+1)
+    constant ShapParams      &p         [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= p.rowCount || gid.y >= p.numPaths) return;
+    uint i = p.rowOffset + gid.x;
+
+    uint  ufeat[SHAP_MAX_PATH];
+    float uzero[SHAP_MAX_PATH];
+    float uone[SHAP_MAX_PATH];
+    uint U = 0;
+    for (uint e = pathStart[gid.y]; e < pathStart[gid.y + 1]; ++e) {
+        ShapElement el = elements[e];
+        float v = X[(ulong)el.feature * p.totalRows + i];
+        bool left;
+        if (el.flags & FLAG_CATEGORICAL) {
+            uint cat = p.dataBins;                       // unseen -> missing
+            if (isfinite(v)) {
+                float r = rint(v);
+                if (r >= 0.0f && uint(r) < p.dataBins) cat = uint(r);
+            }
+            left = (masks[(ulong)el.nodeGlobal * 8u + cat / 32u] >> (cat % 32u)) & 1u;
+        } else if (isnan(v)) {
+            left = (el.flags & FLAG_DEFAULT_LEFT) != 0;
+        } else {
+            left = v <= el.threshold;
+        }
+        float one = (left == ((el.flags & SHAP_CHILD_LEFT) != 0)) ? 1.0f : 0.0f;
+        int k = -1;
+        for (uint j = 0; j < U; ++j)
+            if (ufeat[j] == el.feature) { k = int(j); break; }
+        if (k >= 0) { uzero[k] *= el.zeroFraction; uone[k] *= one; }
+        else { ufeat[U] = el.feature; uzero[U] = el.zeroFraction; uone[U] = one; ++U; }
+    }
+    if (U == 0) return;
+
+    // EXTEND: permutation-weight coefficients over the merged path, with
+    // the standard dummy element (1, 1) at index 0.
+    float pw[SHAP_MAX_PATH + 1];
+    pw[0] = 1.0f;
+    for (uint j = 1; j <= U; ++j) {
+        float one = uone[j - 1], zero = uzero[j - 1];
+        pw[j] = 0.0f;
+        for (int q = int(j) - 1; q >= 0; --q) {
+            pw[q + 1] += one * pw[q] * float(q + 1) / float(j + 1);
+            pw[q]      = zero * pw[q] * float(int(j) - q) / float(j + 1);
+        }
+    }
+
+    float leafV = pathLeaf[gid.y];
+    ulong outBase = ((ulong)i * p.numClasses + pathClass[gid.y])
+                    * (ulong)(p.numFeatures + 1);
+    for (uint idx = 1; idx <= U; ++idx) {
+        float one = uone[idx - 1], zero = uzero[idx - 1];
+        float total = 0.0f;
+        if (one != 0.0f) {
+            float next = pw[U];
+            for (int q = int(U) - 1; q >= 0; --q) {
+                float tmp = next / (float(q + 1) * one);
+                total += tmp;
+                next = pw[q] - tmp * zero * float(int(U) - q);
+            }
+        } else if (zero != 0.0f) {
+            for (int q = int(U) - 1; q >= 0; --q)
+                total += pw[q] / (zero * float(int(U) - q));
+        }
+        float phi = total * float(U + 1) * (one - zero) * leafV;
+        if (phi != 0.0f)
+            atomic_fetch_add_explicit(&out[outBase + ufeat[idx - 1]], phi,
+                                      memory_order_relaxed);
+    }
+}
+
 struct PredictParams { uint numSamples; uint maxDepth; uint numBins; uint predOffset; };
 
 // Assign each sample its leaf node id for the finished tree (leaf renewal
