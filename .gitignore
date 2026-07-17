@@ -10,3 +10,4 @@ predictions.csv
 higgs-cache/
 python/dist/
 python/build/
+private/
