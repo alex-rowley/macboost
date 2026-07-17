@@ -663,6 +663,20 @@ public final class MacBooster {
 
         let predsPtr = predsBuf.contents().bindMemory(to: Float.self, capacity: rows * K)
 
+        // Rows-per-bin hint: histogram maintenance scales with bins
+        // regardless of rows, so at small row counts high bin counts are
+        // pure cost with no added split resolution (bins beyond your
+        // rows-per-node resolve nothing). Surface it once, loudly.
+        if rows / nBins < 64 && nBins > 64 {
+            var suggest = 64
+            while suggest > 32 && rows / suggest < 64 { suggest /= 2 }
+            fitWarnings.append(
+                "max_bin=\(nBins) gives ~\(max(1, rows / nBins)) rows per bin at "
+                + "\(rows) rows; max_bin=\(suggest) is typically 2-4x faster here "
+                + "with equal accuracy (histogram cost scales with bins, resolution "
+                + "does not once bins exceed rows per node)")
+        }
+
         // --- Startup info preamble (zero cost when progress is nil) --------
         if let progress {
             let numCats = params.categoricalFeatures.count

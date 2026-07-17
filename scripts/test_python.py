@@ -178,8 +178,8 @@ check(any("leakage" in str(w.message) for w in caught),
       "label column left inside X triggers a target-leakage warning")
 with warnings.catch_warnings(record=True) as caught:
     warnings.simplefilter("always")
-    MacBoostRegressor(n_estimators=5).fit(Xg, yg)
-check(not caught, "clean data trains without warnings")
+    MacBoostRegressor(n_estimators=5, max_bin=32).fit(Xg, yg)
+check(not caught, "clean data (with fitting bins) trains without warnings")
 
 
 print("pure-python inference backend (Linux deploy path)")
@@ -321,6 +321,18 @@ with _tf.TemporaryDirectory() as _tmp:
     pr_theirs = _ort_predict(f"{_tmp}/mc.onnx", _X4[:2000])
     gap = float(np.abs(pr_ours - pr_theirs).max())
     check(gap < 3e-4, f"onnx multiclass probabilities match (max gap {gap:.2e})")
+
+print("rows-per-bin guidance")
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    MacBoostRegressor(n_estimators=5).fit(Xg[:2000], yg[:2000])   # 2k rows, 256 bins
+check(any("max_bin" in str(w.message) for w in caught),
+      "small rows + default bins surfaces the max_bin hint")
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    MacBoostRegressor(n_estimators=5, max_bin=32).fit(Xg[:2000], yg[:2000])
+check(not any("max_bin" in str(w.message) for w in caught),
+      "no hint when bins already fit the row count")
 
 print("leaf-wise growth (num_leaves)")
 Xh = rng.random((15_000, 6), dtype=np.float32)
