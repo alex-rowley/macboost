@@ -35,7 +35,7 @@ final class MetalEngine {
         "init_tree", "decide_splits", "final_leaves",
         "route_samples", "predict_tree_binned", "predict_forest", "gpu_treeshap", "copy_cover", "assign_leaves", "debug_bounds",
         "goss_grad_hist", "goss_threshold", "goss_select", "goss_finalize",
-        "shadow_bins", "zero_buffer",
+        "shadow_bins", "zero_buffer", "zero_built",
     ]
 
     init() throws {

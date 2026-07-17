@@ -251,19 +251,52 @@ kernel void build_histograms(
 
     float gInvScale = as_type<float>(maxGH[0]) / 32767.0f;
     float hInvScale = as_type<float>(maxGH[1]) / 127.0f;
+    // Occupancy-proportional path: when ONE threadgroup owns the node
+    // (count <= samplesPerGroup — every node once rows-per-node is small),
+    // write the slice densely instead of accumulating, so it needs no
+    // zeroing pass at all. 0 + x == x in fp, so values are bit-identical
+    // to the zero+add path. Multi-group nodes keep atomic accumulation
+    // into a slice that zero_built pre-zeroed.
+    bool single = count <= p.samplesPerGroup;
     for (uint idx = tid; idx < TILE_F * 256; idx += TG_SIZE) {
         uint lane = idx >> 8, b = idx & 0xFFu;
         uint f = tile * TILE_F + lane;
         if (f >= p.numFeatures || b >= p.numBins) continue;
         int  gsum = atomic_load_explicit(&lg[idx], memory_order_relaxed);
         uint hc   = atomic_load_explicit(&lhc[idx], memory_order_relaxed);
-        if (gsum == 0 && hc == 0u) continue;
-        device atomic_float *h =
-            hist + (((ulong)node * p.numFeatures + f) * p.numBins + b) * HIST_CH;
-        atomic_fetch_add_explicit(&h[0], float(gsum) * gInvScale, memory_order_relaxed);
-        atomic_fetch_add_explicit(&h[1], float(hc >> 13) * hInvScale, memory_order_relaxed);
-        atomic_fetch_add_explicit(&h[2], float(hc & 0x1FFFu), memory_order_relaxed);
+        ulong off = (((ulong)node * p.numFeatures + f) * p.numBins + b) * HIST_CH;
+        if (single) {
+            device float *hw = (device float *)hist + off;
+            hw[0] = float(gsum) * gInvScale;
+            hw[1] = float(hc >> 13) * hInvScale;
+            hw[2] = float(hc & 0x1FFFu);
+        } else {
+            if (gsum == 0 && hc == 0u) continue;
+            device atomic_float *h = hist + off;
+            atomic_fetch_add_explicit(&h[0], float(gsum) * gInvScale, memory_order_relaxed);
+            atomic_fetch_add_explicit(&h[1], float(hc >> 13) * hInvScale, memory_order_relaxed);
+            atomic_fetch_add_explicit(&h[2], float(hc & 0x1FFFu), memory_order_relaxed);
+        }
     }
+}
+
+struct ZeroBuiltParams { uint sliceLen; uint numNodes; uint samplesPerGroup; };
+
+// Zero only the histogram slices that will be accumulated into by more
+// than one threadgroup. Single-group builds dense-write their slice,
+// derived siblings are dense-written by subtraction, and dead nodes are
+// never read (find_splits' liveness guard) — none of them need zeroing.
+kernel void zero_built(
+    device const uint     *nodeCount [[buffer(0)]],
+    device float          *hist      [[buffer(1)]],
+    constant ZeroBuiltParams &p      [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint j = gid.x, node = gid.y;
+    if (j >= p.sliceLen || node >= p.numNodes) return;
+    uint c = nodeCount[node];
+    if (c == 0 || c <= p.samplesPerGroup) return;
+    hist[(ulong)node * p.sliceLen + j] = 0.0f;
 }
 
 struct SubParams { uint sliceLen; };   // sliceLen = F * bins * 3
@@ -290,6 +323,7 @@ kernel void subtract_histograms(
 struct SplitParams {
     uint numFeatures; uint numBins; uint numNodes;
     float lambda; float minChildHess; float minSplitGain; float catSmooth;
+    uint levelStart;
 };
 
 struct SplitResult { float gain; uint bin; float gl; float hl; uint flags; };
@@ -331,11 +365,22 @@ kernel void find_splits(
     device const uchar  *featMask  [[buffer(2)]],   // 0 = excluded this tree
     device const char   *monotone  [[buffer(3)]],   // per feature: -1/0/+1
     device SplitResult  *results   [[buffer(4)]],
-    constant SplitParams &p        [[buffer(5)]],
+    device const float4 *stats     [[buffer(5)]],
+    constant SplitParams &p        [[buffer(6)]],
     uint2 gid [[thread_position_in_grid]])
 {
     uint f = gid.x, node = gid.y;
     if (f >= p.numFeatures || node >= p.numNodes) return;
+    // Liveness guard: dead nodes' histogram slices are never zeroed nor
+    // written, so never read them. stats.z (sample count) is written by
+    // decide_splits for both children of every real split; the root is
+    // always live.
+    if (p.levelStart > 0 && stats[p.levelStart + node].z < 1.0f) {
+        SplitResult none;
+        none.gain = -INFINITY; none.bin = 0; none.gl = 0; none.hl = 0; none.flags = 0;
+        results[node * p.numFeatures + f] = none;
+        return;
+    }
     if (featMask[f] == 0) {
         SplitResult none;
         none.gain = -INFINITY; none.bin = 0; none.gl = 0; none.hl = 0; none.flags = 0;

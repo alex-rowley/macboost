@@ -150,9 +150,14 @@ private struct DecideParams {
 private struct FinalParams {
     var lastStart: UInt32; var numLast: UInt32; var lambda: Float; var learningRate: Float
 }
+private struct ZeroBuiltParams {
+    var sliceLen: UInt32; var numNodes: UInt32; var samplesPerGroup: UInt32
+}
+
 private struct SplitParams {
     var numFeatures: UInt32; var numBins: UInt32; var numNodes: UInt32
     var lambda: Float; var minChildHess: Float; var minSplitGain: Float; var catSmooth: Float
+    var levelStart: UInt32
 }
 private struct SplitResult {
     var gain: Float; var bin: UInt32; var gl: Float; var hl: Float; var flags: UInt32
@@ -966,7 +971,15 @@ public final class MacBooster {
                     encodeRoute(d - 1, terminal: false)
                     swap(&histCurBuf, &histPrevBuf)
                 }
-                e.zero(histCurBuf, length: numLevel * cols * nBins * histChannels * 4)
+                e.dispatch("zero_built",
+                           buffers: [buildCountL[d], histCurBuf],
+                           params: ZeroBuiltParams(
+                               sliceLen: UInt32(cols * nBins * histChannels),
+                               numNodes: UInt32(numLevel),
+                               samplesPerGroup: UInt32(samplesPerGroup)),
+                           grid: MTLSize(width: cols * nBins * histChannels,
+                                         height: numLevel, depth: 1),
+                           threadgroup: tg1D)
                 e.dispatchIndirect("build_histograms",
                                         buffers: [binsBuf, ghqBuf, orderBuf(d),
                                                   segStartL[d], buildCountL[d], histCurBuf,
@@ -987,14 +1000,15 @@ public final class MacBooster {
                 }
                 e.dispatch("find_splits",
                                 buffers: [histCurBuf, featFlagsBuf, featMaskBuf,
-                                          monotoneBuf, splitResBuf],
+                                          monotoneBuf, splitResBuf, statsBuf],
                                 params: SplitParams(numFeatures: UInt32(cols),
                                                     numBins: UInt32(nBins),
                                                     numNodes: UInt32(numLevel),
                                                     lambda: lambda,
                                                     minChildHess: params.minChildHess,
                                                     minSplitGain: params.minSplitGain,
-                                                    catSmooth: params.catSmooth),
+                                                    catSmooth: params.catSmooth,
+                                                    levelStart: UInt32(levelStart)),
                                 grid: MTLSize(width: cols, height: numLevel, depth: 1),
                                 threadgroup: tg1D)
                 let nextLevel = min(d + 1, maxDepth - 1)
