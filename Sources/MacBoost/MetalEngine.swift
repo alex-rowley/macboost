@@ -70,6 +70,11 @@ final class MetalEngine {
         device.makeBuffer(length: max(length, 16), options: .storageModeShared)!
     }
 
+    func makeBuffer(bytes: UnsafeRawPointer, length: Int) -> MTLBuffer {
+        device.makeBuffer(bytes: bytes, length: max(length, 16),
+                          options: .storageModeShared)!
+    }
+
     func makeBuffer<T>(_ array: [T]) -> MTLBuffer {
         array.withUnsafeBytes { raw in
             device.makeBuffer(bytes: raw.baseAddress!, length: raw.count,

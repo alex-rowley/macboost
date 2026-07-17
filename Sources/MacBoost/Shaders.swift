@@ -38,7 +38,10 @@ inline ulong bin_index(uint f, uint i, uint numSamples) {
     return (ulong)(f >> 3) * numSamples * TILE_F + (ulong)i * TILE_F + (f & 7u);
 }
 
-struct BinParams { uint numSamples; uint numFeatures; uint numBins; };
+struct BinParams {
+    uint numSamples; uint numFeatures; uint numBins;
+    uint rowStride; uint colStride;
+};
 
 // One thread per (sample, feature). Numeric features binary-search the
 // quantile edges; categorical features map the (validated) category id
@@ -54,7 +57,7 @@ kernel void bin_data(
     uint i = gid.x, f = gid.y;
     if (i >= p.numSamples || f >= p.numFeatures) return;
     uint dataBins = p.numBins - 1;
-    float v = X[(ulong)f * p.numSamples + i];
+    float v = X[(ulong)i * p.rowStride + (ulong)f * p.colStride];
     uchar b;
     if (isnan(v)) {
         b = uchar(dataBins);                        // missing bin

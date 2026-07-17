@@ -68,6 +68,30 @@ public enum EvalMetric: String, CaseIterable {
     case multiLogloss = "multi_logloss"
 }
 
+/// Read-only strided view over a caller-owned float matrix:
+/// value(i, f) = base[i * rowStride + f * colStride]. The pointer must
+/// stay valid for the duration of the call it is passed to.
+public struct MatrixView {
+    public let base: UnsafePointer<Float>
+    public let rows: Int
+    public let cols: Int
+    public let rowStride: Int
+    public let colStride: Int
+
+    public init(base: UnsafePointer<Float>, rows: Int, cols: Int, rowMajor: Bool) {
+        self.base = base
+        self.rows = rows
+        self.cols = cols
+        self.rowStride = rowMajor ? cols : 1
+        self.colStride = rowMajor ? 1 : rows
+    }
+
+    @inline(__always) func value(_ i: Int, _ f: Int) -> Float {
+        base[i * rowStride + f * colStride]
+    }
+    var isFeatureMajor: Bool { colStride == rows }
+}
+
 public struct EvalSet {
     public let featureMajor: [Float]
     public let rows: Int
@@ -125,7 +149,10 @@ let flagDefaultLeft: UInt32 = 1
 let flagCategorical: UInt32 = 2
 
 // Param structs mirroring the MSL structs (all 4-byte fields, no padding).
-struct BinParams { var numSamples: UInt32; var numFeatures: UInt32; var numBins: UInt32 }
+struct BinParams {
+    var numSamples: UInt32; var numFeatures: UInt32; var numBins: UInt32
+    var rowStride: UInt32; var colStride: UInt32
+}
 private struct GradParams {
     var numSamples: UInt32; var objective: UInt32
     var alpha: Float; var aux: Float; var hasWeights: UInt32
@@ -315,8 +342,32 @@ public final class MacBooster {
                     earlyStoppingRounds: Int = 0, evalEvery: Int = 0,
                     initModel: MacBooster? = nil,
                     progress: ((String) -> Void)? = nil) throws -> FitTimings {
-        try fitImpl(X: X, prebinned: nil, rows: rows, cols: cols, labels: labels,
-                    weights: weights, valid: valid,
+        guard X.count == rows * cols else {
+            throw MacBoostError.invalidInput(
+                "X has \(X.count) values, expected rows*cols = \(rows * cols)")
+        }
+        return try X.withUnsafeBufferPointer { xp in
+            try fitImpl(X: MatrixView(base: xp.baseAddress!, rows: rows, cols: cols,
+                                      rowMajor: false),
+                        prebinned: nil, rows: rows, cols: cols, labels: labels,
+                        weights: weights, valid: valid,
+                        earlyStoppingRounds: earlyStoppingRounds,
+                        evalEvery: evalEvery, initModel: initModel, progress: progress)
+        }
+    }
+
+    /// Train from a borrowed matrix view (no copies; the caller's memory
+    /// must stay valid for the duration of the call). Row-major views are
+    /// numpy's native layout, so language bindings pass data straight
+    /// through. Warm starts (initModel) require a feature-major view.
+    @discardableResult
+    public func fit(view: MatrixView, labels: [Float],
+                    weights: [Float]? = nil, valid: EvalSet? = nil,
+                    earlyStoppingRounds: Int = 0, evalEvery: Int = 0,
+                    initModel: MacBooster? = nil,
+                    progress: ((String) -> Void)? = nil) throws -> FitTimings {
+        try fitImpl(X: view, prebinned: nil, rows: view.rows, cols: view.cols,
+                    labels: labels, weights: weights, valid: valid,
                     earlyStoppingRounds: earlyStoppingRounds,
                     evalEvery: evalEvery, initModel: initModel, progress: progress)
     }
@@ -347,7 +398,11 @@ public final class MacBooster {
         for (i, v) in labels.enumerated() where !v.isFinite {
             throw MacBoostError.invalidInput("label at row \(i) is \(v); labels must be finite")
         }
-        try validateCategoricals(X, rows: rows, cols: cols)
+        try X.withUnsafeBufferPointer { xp in
+            try validateCategoricals(
+                MatrixView(base: xp.baseAddress!, rows: rows, cols: cols,
+                           rowMajor: false), rows: rows, cols: cols)
+        }
         let nBins = params.numBins
         var featFlags = [UInt8](repeating: 0, count: cols)
         for f in params.categoricalFeatures { featFlags[f] = 1 }
@@ -362,7 +417,9 @@ public final class MacBooster {
                                   binsBuf, engine.makeBuffer(featFlags)],
                         params: BinParams(numSamples: UInt32(rows),
                                           numFeatures: UInt32(cols),
-                                          numBins: UInt32(nBins)),
+                                          numBins: UInt32(nBins),
+                                          rowStride: 1,
+                                          colStride: UInt32(rows)),
                         grid: MTLSize(width: rows, height: cols, depth: 1),
                         threadgroup: MTLSize(width: tgSize, height: 1, depth: 1))
         cb.commit()
@@ -385,7 +442,7 @@ public final class MacBooster {
         let numBins: Int
     }
 
-    func fitImpl(X: [Float]?, prebinned: BinnedDataset?,
+    func fitImpl(X: MatrixView?, prebinned: BinnedDataset?,
                  gpuBinned: GPUBinned? = nil, rows: Int, cols: Int,
                          labels: [Float], weights: [Float]?, valid: EvalSet?,
                          earlyStoppingRounds: Int, evalEvery: Int,
@@ -393,12 +450,6 @@ public final class MacBooster {
                          progress: ((String) -> Void)?) throws -> FitTimings {
         guard rows > 0 && cols > 0 else {
             throw MacBoostError.invalidInput("training data is empty (rows=\(rows), cols=\(cols))")
-        }
-        if let X {
-            guard X.count == rows * cols else {
-                throw MacBoostError.invalidInput(
-                    "X has \(X.count) values, expected rows*cols = \(rows * cols)")
-            }
         }
         guard labels.count == rows else {
             throw MacBoostError.invalidInput("labels has \(labels.count) rows, X has \(rows)")
@@ -434,7 +485,7 @@ public final class MacBooster {
             }
         }
         if let im = initModel {
-            guard X != nil else {
+            guard let xv = X, xv.isFeatureMajor else {
                 throw MacBoostError.invalidInput(
                     "initModel requires raw features (not a prebinned dataset)")
             }
@@ -470,7 +521,11 @@ public final class MacBooster {
 
         if let X { try validateCategoricals(X, rows: rows, cols: cols) }
         if let v = valid {
-            try validateCategoricals(v.featureMajor, rows: v.rows, cols: cols)
+            try v.featureMajor.withUnsafeBufferPointer { vp in
+                try validateCategoricals(
+                    MatrixView(base: vp.baseAddress!, rows: v.rows, cols: cols,
+                               rowMajor: false), rows: v.rows, cols: cols)
+            }
         }
 
         var featFlags = [UInt8](repeating: 0, count: cols)
@@ -497,8 +552,8 @@ public final class MacBooster {
             edges = ds.edges
             binsBuf = engine.makeBuffer(ds.bins)
         } else {
-            edges = Binner.computeEdges(featureMajor: X!, rows: rows, cols: cols,
-                                        numBins: nBins, categorical: categorical)
+            edges = Binner.computeEdges(view: X!, numBins: nBins,
+                                         categorical: categorical)
             binsBuf = engine.makeBuffer(length: rows * numTiles * tileF)
         }
         do {
@@ -506,12 +561,15 @@ public final class MacBooster {
             var needsCommit = false
             if prebinned == nil && gpuBinned == nil {
                 let edgesBuf = engine.makeBuffer(edges)
-                let xBuf = engine.makeBuffer(X!)
+                let xBuf = engine.makeBuffer(bytes: X!.base,
+                                             length: rows * cols * 4)
                 engine.dispatch(cb, "bin_data",
                                 buffers: [xBuf, edgesBuf, binsBuf, featFlagsBuf],
                                 params: BinParams(numSamples: UInt32(rows),
                                                   numFeatures: UInt32(cols),
-                                                  numBins: UInt32(nBins)),
+                                                  numBins: UInt32(nBins),
+                                                  rowStride: UInt32(X!.rowStride),
+                                                  colStride: UInt32(X!.colStride)),
                                 grid: MTLSize(width: rows, height: cols, depth: 1),
                                 threadgroup: MTLSize(width: tgSize, height: 1, depth: 1))
                 needsCommit = true
@@ -523,7 +581,9 @@ public final class MacBooster {
                                 buffers: [vxBuf, edgesBuf, vb, featFlagsBuf],
                                 params: BinParams(numSamples: UInt32(v.rows),
                                                   numFeatures: UInt32(cols),
-                                                  numBins: UInt32(nBins)),
+                                                  numBins: UInt32(nBins),
+                                                  rowStride: 1,
+                                                  colStride: UInt32(v.rows)),
                                 grid: MTLSize(width: v.rows, height: cols, depth: 1),
                                 threadgroup: MTLSize(width: tgSize, height: 1, depth: 1))
                 needsCommit = true
@@ -788,9 +848,13 @@ public final class MacBooster {
         }
         if let im = initModel, let X {
             // Warm start: running predictions begin at the init model's raw
-            // scores; its trees become the ensemble prefix.
+            // scores; its trees become the ensemble prefix. (Feature-major
+            // view enforced at validation.)
             baseScore = im.baseScore
-            let seed = im.predictRawScores(featureMajor: X, rows: rows, cols: cols)
+            let seed = im.predictRawScores(
+                featureMajor: Array(UnsafeBufferPointer(start: X.base,
+                                                        count: rows * cols)),
+                rows: rows, cols: cols)
             seed.withUnsafeBufferPointer { predsPtr.update(from: $0.baseAddress!, count: rows) }
             if let v = valid, let vp = validPredsBuf {
                 let vseed = im.predictRawScores(featureMajor: v.featureMajor,
@@ -1704,7 +1768,7 @@ public final class MacBooster {
     /// IS the label (or a prior prediction of it) left in X. Checks
     /// |correlation| on a small subsample — costs microseconds, catches the
     /// mistake neither LightGBM nor XGBoost warns about.
-    private func checkLabelLeakage(_ X: [Float], rows: Int, cols: Int, labels: [Float],
+    private func checkLabelLeakage(_ X: MatrixView, rows: Int, cols: Int, labels: [Float],
                                    progress: ((String) -> Void)?) {
         let step = max(1, rows / 4096)
         var idx = [Int]()
@@ -1719,13 +1783,13 @@ public final class MacBooster {
         for f in 0..<cols {
             var sxy = 0.0, sxx = 0.0, syy = 0.0, xm = 0.0
             var n = 0
-            for i in idx where X[f * rows + i].isFinite {
-                xm += Double(X[f * rows + i]); n += 1
+            for i in idx where X.value(i, f).isFinite {
+                xm += Double(X.value(i, f)); n += 1
             }
             guard n >= 50 else { continue }
             xm /= Double(n)
             for i in idx {
-                let x = Double(X[f * rows + i])
+                let x = Double(X.value(i, f))
                 guard x.isFinite else { continue }
                 let dx = x - xm, dy = Double(labels[i]) - ym
                 sxy += dx * dy; sxx += dx * dx; syy += dy * dy
@@ -1743,14 +1807,14 @@ public final class MacBooster {
         }
     }
 
-    func validateCategoricals(_ X: [Float], rows: Int, cols: Int) throws {
+    func validateCategoricals(_ X: MatrixView, rows: Int, cols: Int) throws {
         let dataBins = params.numBins - 1
         for f in params.categoricalFeatures {
             guard f >= 0 && f < cols else {
                 throw MacBoostError.internalError("categorical feature index \(f) out of range")
             }
             for i in 0..<rows {
-                let v = X[f * rows + i]
+                let v = X.value(i, f)
                 if v.isNaN { continue }
                 let c = v.rounded(.toNearestOrEven)
                 if c < 0 || Int(c) >= dataBins {

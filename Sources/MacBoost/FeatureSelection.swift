@@ -68,7 +68,11 @@ extension MacBooster {
             }
         }
         try validateLabels(labels)
-        try validateCategoricals(X, rows: rows, cols: cols)
+        try X.withUnsafeBufferPointer { xp in
+            try validateCategoricals(
+                MatrixView(base: xp.baseAddress!, rows: rows, cols: cols,
+                           rowMajor: false), rows: rows, cols: cols)
+        }
 
         // Bin the real features once; every round reuses these bytes.
         let nBins = params.numBins
@@ -86,7 +90,9 @@ extension MacBooster {
                                       binsBuf, engine.makeBuffer(featFlags)],
                             params: BinParams(numSamples: UInt32(rows),
                                               numFeatures: UInt32(cols),
-                                              numBins: UInt32(nBins)),
+                                              numBins: UInt32(nBins),
+                                              rowStride: 1,
+                                              colStride: UInt32(rows)),
                             grid: MTLSize(width: rows, height: cols, depth: 1),
                             threadgroup: MTLSize(width: 256, height: 1, depth: 1))
             cb.commit()

@@ -87,6 +87,7 @@ private func booster(_ handle: UnsafeMutableRawPointer) -> MacBooster {
 public func macboost_train(
     _ paramsJSON: UnsafePointer<CChar>?,
     _ x: UnsafePointer<Float>?, _ rows: Int64, _ cols: Int64,
+    _ rowMajor: Int32,
     _ y: UnsafePointer<Float>?,
     _ w: UnsafePointer<Float>?,
     _ xValid: UnsafePointer<Float>?, _ validRows: Int64, _ yValid: UnsafePointer<Float>?,
@@ -102,7 +103,6 @@ public func macboost_train(
             cfg = try JSONDecoder().decode(CConfig.self, from: data)
         }
         let b = try MacBooster(params: makeParams(cfg))
-        let X = Array(UnsafeBufferPointer(start: x, count: Int(rows * cols)))
         let Y = Array(UnsafeBufferPointer(start: y, count: Int(rows)))
         var evalSet: EvalSet?
         if let xValid, let yValid, validRows > 0 {
@@ -117,7 +117,12 @@ public func macboost_train(
         let initModel = try cfg.init_model.map {
             try MacBooster.load(from: URL(fileURLWithPath: $0))
         }
-        try b.fit(featureMajor: X, rows: Int(rows), cols: Int(cols), labels: Y,
+        // Borrowed view: the caller's matrix is read in place (one copy
+        // into GPU-shared memory inside fit, nothing else). Warm starts
+        // need feature-major, which the binding guarantees.
+        let view = MatrixView(base: x, rows: Int(rows), cols: Int(cols),
+                              rowMajor: rowMajor != 0)
+        try b.fit(view: view, labels: Y,
                   weights: weights, valid: evalSet,
                   earlyStoppingRounds: cfg.early_stopping_rounds ?? 0,
                   evalEvery: cfg.eval_every ?? 0,

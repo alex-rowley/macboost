@@ -59,8 +59,8 @@ _lib = _LazyLib()
 def _configure(_lib):
     _lib.macboost_train.restype = ctypes.c_void_p
     _lib.macboost_train.argtypes = [
-        ctypes.c_char_p, _f32_p, ctypes.c_int64, ctypes.c_int64, _f32_p, _f32_p,
-        _f32_p, ctypes.c_int64, _f32_p, _c_char_pp,
+        ctypes.c_char_p, _f32_p, ctypes.c_int64, ctypes.c_int64, ctypes.c_int32,
+        _f32_p, _f32_p, _f32_p, ctypes.c_int64, _f32_p, _c_char_pp,
     ]
     _lib.macboost_select_features.restype = ctypes.c_int32
     _lib.macboost_select_features.argtypes = [
@@ -133,7 +133,19 @@ class _Handle:
 
 
 def train(config: dict, X, y, eval_set=None, sample_weight=None) -> _Handle:
-    Xf, rows, cols = _feature_major(X)
+    # Row-major fast path: numpy's native layout goes straight through the
+    # ABI with no transpose copy (the core strides over it during binning).
+    # Warm starts still need the feature-major layout for seed predictions.
+    if "init_model" in config:
+        Xf, rows, cols = _feature_major(X)
+        layout = 0
+    else:
+        a = np.asarray(X, dtype=np.float32)
+        if a.ndim != 2:
+            raise ValueError(f"X must be 2-dimensional, got shape {a.shape}")
+        Xf = np.ascontiguousarray(a)          # no-op if already C-contiguous f32
+        rows, cols = a.shape
+        layout = 1
     ya = np.ascontiguousarray(np.asarray(y, dtype=np.float32).ravel())
     if ya.shape[0] != rows:
         raise ValueError(f"y has {ya.shape[0]} rows, X has {rows}")
@@ -157,7 +169,7 @@ def train(config: dict, X, y, eval_set=None, sample_weight=None) -> _Handle:
 
     err = ctypes.c_char_p()
     ptr = _lib.macboost_train(
-        json.dumps(config).encode(), _f32(Xf), rows, cols, _f32(ya), w_ptr,
+        json.dumps(config).encode(), _f32(Xf), rows, cols, layout, _f32(ya), w_ptr,
         xv_ptr, vrows, yv_ptr, ctypes.byref(err),
     )
     if not ptr:
