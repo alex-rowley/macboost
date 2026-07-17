@@ -69,7 +69,7 @@ _PARAM_NAMES = (
     "objective", "alpha", "tweedie_variance_power", "scale_pos_weight",
     "subsample", "colsample_bytree", "monotone_constraints", "metric",
     "importance_type", "feature_selection", "selection_rounds",
-    "selection_alpha", "allowed_features",
+    "selection_estimators", "selection_alpha", "allowed_features",
 )
 
 
@@ -117,7 +117,8 @@ class _BaseBooster:
                  scale_pos_weight=1.0, subsample=1.0, colsample_bytree=1.0,
                  monotone_constraints=None, metric="auto",
                  importance_type="gain", feature_selection=False,
-                 selection_rounds=20, selection_alpha=0.05,
+                 selection_rounds=20, selection_estimators=None,
+                 selection_alpha=0.05,
                  allowed_features=None, **aliases):
         self.n_estimators = n_estimators
         self.max_depth = max_depth
@@ -144,6 +145,7 @@ class _BaseBooster:
         self.importance_type = importance_type
         self.feature_selection = feature_selection
         self.selection_rounds = selection_rounds
+        self.selection_estimators = selection_estimators
         self.selection_alpha = selection_alpha
         self.allowed_features = allowed_features
         self._handle = None
@@ -202,13 +204,18 @@ class _BaseBooster:
         return cfg
 
     def select_features(self, X, y, sample_weight=None, rounds=None,
-                        alpha=None, seed=0):
+                        estimators=None, alpha=None, seed=0):
         """Boruta shadow-feature selection, GPU-resident: each round
         trains on [X | permuted copies of X] (shadows exist only as GPU
         bin bytes) and a feature is confirmed / rejected by a binomial
         test on how often its gain beats the best shadow. Returns a
         FeatureSelection; use fit(feature_selection=True) to select and
-        train in one call."""
+        train in one call.
+
+        The probe models default to min(n_estimators, 100) rounds —
+        Boruta needs gain-vs-shadow votes, not converged ensembles.
+        Override with `estimators` (or `selection_estimators` in the
+        constructor) to trade selection cost against vote stability."""
         if not _core.native_available():
             raise MacBoostError(
                 "feature selection requires the native Metal core "
@@ -219,9 +226,12 @@ class _BaseBooster:
         if self.classes_ is not None and len(self.classes_) > 2:
             cfg["objective"] = "multiclass"
             cfg["num_class"] = len(self.classes_)
+        if estimators is None:
+            estimators = self.selection_estimators
         hits, decision, ratio = _core.select_features(
             cfg, X, y, sample_weight,
             rounds=rounds if rounds is not None else self.selection_rounds,
+            trees=int(estimators) if estimators else 0,
             alpha=alpha if alpha is not None else self.selection_alpha,
             seed=seed)
         return FeatureSelection(hits=hits, decision=decision, gain_ratio=ratio,

@@ -37,9 +37,15 @@ extension MacBooster {
     /// corrected binomial test. Use the result via
     /// `params.allowedFeatures` on a fresh booster (the final model then
     /// never splits on rejected features but still accepts full-width X).
+    ///
+    /// `trees` sizes the disposable probe models. Boruta needs gain-vs-
+    /// shadow votes, not converged ensembles, so the probes default to
+    /// min(numTrees, 100) boosting rounds rather than the full spec —
+    /// pass an explicit count to override either way.
     public func selectFeatures(featureMajor X: [Float], rows: Int, cols: Int,
                                labels: [Float], weights: [Float]? = nil,
-                               rounds: Int = 20, alpha: Double = 0.05,
+                               rounds: Int = 20, trees: Int? = nil,
+                               alpha: Double = 0.05,
                                seed: UInt64 = 0,
                                progress: ((String) -> Void)? = nil) throws
         -> FeatureSelectionResult {
@@ -55,6 +61,11 @@ extension MacBooster {
         }
         guard alpha > 0 && alpha < 1 else {
             throw MacBoostError.invalidInput("alpha must be in (0, 1)")
+        }
+        if let trees {
+            guard trees >= 1 else {
+                throw MacBoostError.invalidInput("selection trees must be >= 1")
+            }
         }
         try validateLabels(labels)
         try validateCategoricals(X, rows: rows, cols: cols)
@@ -97,35 +108,41 @@ extension MacBooster {
         selParams.monotoneConstraints = nil
         selParams.allowedFeatures = nil
         selParams.categoricalFeatures = categorical2
+        selParams.numTrees = trees ?? min(params.numTrees, 100)
 
         var hits = [Int](repeating: 0, count: cols)
         var gainSum = [Double](repeating: 0, count: cols)
         var shadowSum = 0.0
         for round in 0..<rounds {
-            let roundSeed = UInt32(truncatingIfNeeded:
-                seed &+ UInt64(round) &* 0x9E3779B97F4A7C15 &+ 1)
-            let cb = engine.queue.makeCommandBuffer()!
-            engine.dispatch(cb, "shadow_bins",
-                            buffers: [binsBuf, bins2Buf],
-                            params: ShadowParamsHost(numSamples: UInt32(rows),
-                                                     numFeatures: UInt32(cols),
-                                                     halfBits: halfBits,
-                                                     seed: roundSeed),
-                            grid: MTLSize(width: rows, height: cols, depth: 1),
-                            threadgroup: MTLSize(width: 256, height: 1, depth: 1))
-            cb.commit()
-            cb.waitUntilCompleted()
+            // Each round creates thousands of autoreleased Metal objects
+            // (one command buffer per tree); drain them per round or a
+            // long selection run on a big multiclass spec gets jetsammed.
+            let gains = try autoreleasepool { () -> [Float] in
+                let roundSeed = UInt32(truncatingIfNeeded:
+                    seed &+ UInt64(round) &* 0x9E3779B97F4A7C15 &+ 1)
+                let cb = engine.queue.makeCommandBuffer()!
+                engine.dispatch(cb, "shadow_bins",
+                                buffers: [binsBuf, bins2Buf],
+                                params: ShadowParamsHost(numSamples: UInt32(rows),
+                                                         numFeatures: UInt32(cols),
+                                                         halfBits: halfBits,
+                                                         seed: roundSeed),
+                                grid: MTLSize(width: rows, height: cols, depth: 1),
+                                threadgroup: MTLSize(width: 256, height: 1, depth: 1))
+                cb.commit()
+                cb.waitUntilCompleted()
 
-            let sb = try MacBooster(params: selParams, engine: engine)
-            try sb.fitImpl(X: nil, prebinned: nil,
-                           gpuBinned: GPUBinned(bins: bins2Buf, edges: edges2,
-                                                categorical: categorical2,
-                                                numBins: nBins),
-                           rows: rows, cols: cols2, labels: labels,
-                           weights: weights, valid: nil,
-                           earlyStoppingRounds: 0, evalEvery: 0,
-                           initModel: nil, progress: nil)
-            let gains = sb.featureImportance(type: .gain)
+                let sb = try MacBooster(params: selParams, engine: engine)
+                try sb.fitImpl(X: nil, prebinned: nil,
+                               gpuBinned: GPUBinned(bins: bins2Buf, edges: edges2,
+                                                    categorical: categorical2,
+                                                    numBins: nBins),
+                               rows: rows, cols: cols2, labels: labels,
+                               weights: weights, valid: nil,
+                               earlyStoppingRounds: 0, evalEvery: 0,
+                               initModel: nil, progress: nil)
+                return sb.featureImportance(type: .gain)
+            }
             let maxShadow = gains[cols...].max() ?? 0
             for f in 0..<cols where gains[f] > maxShadow { hits[f] += 1 }
             for f in 0..<cols { gainSum[f] += Double(gains[f]) }

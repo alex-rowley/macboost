@@ -206,6 +206,30 @@ final class SelectionTests: XCTestCase {
         XCTAssertEqual(result.confirmed, [0])
     }
 
+    /// Probe models are sized independently of the final spec: a
+    /// heavyweight configured model still runs selection with clamped
+    /// probes (min(numTrees, 100)), an explicit `trees` override works
+    /// at small sizes, and trees < 1 throws.
+    func testProbeModelSizing() throws {
+        let (X, y, cols) = signalPlusNoise(rows: 4_000, seed: 441)
+        var p = BoosterParams(); p.numTrees = 400
+        let auto = try MacBooster(params: p).selectFeatures(
+            featureMajor: X, rows: 4_000, cols: cols, labels: y, rounds: 10)
+        XCTAssertGreaterThanOrEqual(auto.confirmed.filter { $0 < 5 }.count, 4,
+            "clamped probes must still separate signal (\(auto.confirmed))")
+        XCTAssertTrue(auto.confirmed.allSatisfy { $0 < 5 })
+
+        let light = try MacBooster(params: p).selectFeatures(
+            featureMajor: X, rows: 4_000, cols: cols, labels: y, rounds: 10, trees: 20)
+        XCTAssertGreaterThanOrEqual(light.confirmed.filter { $0 < 5 }.count, 4,
+            "20-tree probes must still separate signal (\(light.confirmed))")
+        XCTAssertTrue(light.confirmed.allSatisfy { $0 < 5 })
+
+        XCTAssertThrowsError(try MacBooster(params: p).selectFeatures(
+            featureMajor: X, rows: 4_000, cols: cols, labels: y, rounds: 10, trees: 0),
+            "trees < 1 must throw")
+    }
+
     // MARK: - Input validation
 
     func testSelectionInputValidation() throws {

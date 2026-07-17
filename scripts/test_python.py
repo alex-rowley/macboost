@@ -390,6 +390,17 @@ try:
 except MacBoostError as e:
     check("allowedFeatures" in str(e), "out-of-range allowed_features rejected")
 
+# Probe-model sizing: selection under a heavyweight final spec uses light
+# probes (min(n_estimators, 100)) and an explicit override still selects.
+sel_light = MacBoostRegressor(n_estimators=400).select_features(
+    Xsel, y, rounds=10, estimators=20)
+check(all(f < 5 for f in sel_light.confirmed_) and len(sel_light.confirmed_) >= 4,
+      f"20-tree probe models still separate signal ({sel_light!r})")
+m_heavy = MacBoostRegressor(n_estimators=150, feature_selection=True,
+                            selection_rounds=10, selection_estimators=25).fit(Xsel, y)
+check(all(f < 5 for f in m_heavy.selected_features_),
+      "selection_estimators constructor knob drives the probe size")
+
 # sklearn protocol still holds with the new params.
 from sklearn.base import clone as _clone
 est_sel = MacBoostRegressor(feature_selection=True, selection_rounds=7,

@@ -134,7 +134,7 @@ public func macboost_select_features(
     _ x: UnsafePointer<Float>?, _ rows: Int64, _ cols: Int64,
     _ y: UnsafePointer<Float>?,
     _ w: UnsafePointer<Float>?,
-    _ rounds: Int32, _ alpha: Float, _ seed: Int64,
+    _ rounds: Int32, _ trees: Int32, _ alpha: Float, _ seed: Int64,
     _ outHits: UnsafeMutablePointer<Int32>?,      // cols entries
     _ outDecision: UnsafeMutablePointer<Int32>?,  // 2 confirmed / 1 tentative / 0 rejected
     _ outGainRatio: UnsafeMutablePointer<Float>?, // cols entries
@@ -157,7 +157,8 @@ public func macboost_select_features(
         let weights = w.map { Array(UnsafeBufferPointer(start: $0, count: Int(rows))) }
         let result = try b.selectFeatures(
             featureMajor: X, rows: Int(rows), cols: Int(cols), labels: Y,
-            weights: weights, rounds: Int(rounds), alpha: Double(alpha),
+            weights: weights, rounds: Int(rounds),
+            trees: trees > 0 ? Int(trees) : nil, alpha: Double(alpha),
             seed: UInt64(bitPattern: seed),
             progress: verbose ? { print($0) } : nil)
         for f in 0..<Int(cols) {

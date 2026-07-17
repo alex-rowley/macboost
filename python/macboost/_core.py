@@ -65,7 +65,7 @@ def _configure(_lib):
     _lib.macboost_select_features.restype = ctypes.c_int32
     _lib.macboost_select_features.argtypes = [
         ctypes.c_char_p, _f32_p, ctypes.c_int64, ctypes.c_int64, _f32_p, _f32_p,
-        ctypes.c_int32, ctypes.c_float, ctypes.c_int64,
+        ctypes.c_int32, ctypes.c_int32, ctypes.c_float, ctypes.c_int64,
         ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32), _f32_p,
         _c_char_pp,
     ]
@@ -166,7 +166,7 @@ def train(config: dict, X, y, eval_set=None, sample_weight=None) -> _Handle:
 
 
 def select_features(config: dict, X, y, sample_weight=None,
-                    rounds: int = 20, alpha: float = 0.05,
+                    rounds: int = 20, trees: int = 0, alpha: float = 0.05,
                     seed: int = 0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Boruta shadow selection in the native core. Returns (hits, decision,
     gain_ratio) where decision is 2=confirmed, 1=tentative, 0=rejected."""
@@ -186,7 +186,7 @@ def select_features(config: dict, X, y, sample_weight=None,
     err = ctypes.c_char_p()
     rc = _lib.macboost_select_features(
         json.dumps(config).encode(), _f32(Xf), rows, cols, _f32(ya), w_ptr,
-        rounds, alpha, seed,
+        rounds, trees, alpha, seed,
         hits.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
         decision.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
         _f32(ratio), ctypes.byref(err))

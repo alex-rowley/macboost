@@ -54,6 +54,7 @@ TRAIN OPTIONS:
   --feature-selection      Boruta shadow selection before training: only
                            confirmed features may split (GPU-resident)
   --selection-rounds <n>   Boruta rounds                               [default: 20]
+  --selection-trees <n>    probe-model rounds            [default: min(trees, 100)]
   --early-stopping <n>     stop after n rounds without valid improvement
   --eval-every <n>         print metrics every n rounds                [default: 10]
   --format <f>             auto | csv | tsv | libsvm                   [default: auto]
@@ -255,9 +256,11 @@ func runTrain(_ flags: [String: String]) {
             if flags["feature-selection"] != nil {
                 let selector = try MacBooster(params: params)
                 let rounds = Int(flags["selection-rounds"] ?? "20") ?? 20
+                let selTrees = flags["selection-trees"].flatMap { Int($0) }
                 let sel = try selector.selectFeatures(
                     featureMajor: X, rows: table.rows, cols: featureNames.count,
-                    labels: y, weights: weights, rounds: rounds) { print($0) }
+                    labels: y, weights: weights, rounds: rounds,
+                    trees: selTrees) { print($0) }
                 for f in sel.rejected {
                     print("  rejected: \(featureNames[f]) " +
                           String(format: "(beat shadows %d/%d rounds)", sel.hits[f], rounds))
