@@ -214,11 +214,13 @@ kernel void build_histograms(
     device const uint   *nodeCount [[buffer(4)]],
     device atomic_float *hist      [[buffer(5)]],
     device const uint   *maxGH     [[buffer(6)]],
-    constant HistParams &p         [[buffer(7)]],
+    device const uint   *nodeSlot  [[buffer(7)]],   // node -> hist slice index
+    constant HistParams &p         [[buffer(8)]],
     uint3 tg  [[threadgroup_position_in_grid]],
     uint  tid [[thread_index_in_threadgroup]])
 {
     uint node = tg.z, tile = tg.y;
+    uint slot = nodeSlot[node];
     uint count = nodeCount[node];
     uint blockStart = tg.x * p.samplesPerGroup;
     if (blockStart >= count) return;   // uniform per threadgroup: safe early-out
@@ -264,7 +266,7 @@ kernel void build_histograms(
         if (f >= p.numFeatures || b >= p.numBins) continue;
         int  gsum = atomic_load_explicit(&lg[idx], memory_order_relaxed);
         uint hc   = atomic_load_explicit(&lhc[idx], memory_order_relaxed);
-        ulong off = (((ulong)node * p.numFeatures + f) * p.numBins + b) * HIST_CH;
+        ulong off = (((ulong)slot * p.numFeatures + f) * p.numBins + b) * HIST_CH;
         if (single) {
             device float *hw = (device float *)hist + off;
             hw[0] = float(gsum) * gInvScale;
@@ -366,7 +368,8 @@ kernel void find_splits(
     device const char   *monotone  [[buffer(3)]],   // per feature: -1/0/+1
     device SplitResult  *results   [[buffer(4)]],
     device const float4 *stats     [[buffer(5)]],
-    constant SplitParams &p        [[buffer(6)]],
+    device const uint   *nodeSlot  [[buffer(6)]],
+    constant SplitParams &p        [[buffer(7)]],
     uint2 gid [[thread_position_in_grid]])
 {
     uint f = gid.x, node = gid.y;
@@ -388,7 +391,7 @@ kernel void find_splits(
         return;
     }
     device const float *h =
-        hist + (((ulong)node * p.numFeatures + f) * p.numBins) * HIST_CH;
+        hist + (((ulong)nodeSlot[node] * p.numFeatures + f) * p.numBins) * HIST_CH;
     uint dataBins = p.numBins - 1;
 
     float G = 0.0f, H = 0.0f;
@@ -469,61 +472,88 @@ inline bool goes_left(uchar b, NodeSplit s, uint numBins,
     return b <= uchar(s.bin);
 }
 
-// --- Leaf-wise growth: single-segment stable partition -----------------
-// Splitting one leaf partitions ITS slice of the order buffer into
-// left|right. Three dispatches: per-group left counts, a serial exclusive
-// scan, then a chunked stable scatter into a scratch buffer (each thread
-// owns a contiguous chunk, so within-chunk order is preserved and chunk
-// bases come from a threadgroup scan).
+// --- Leaf-wise growth ---------------------------------------------------
+// Device-driven best-first control: leaf_pick_apply chooses the next leaf
+// to split and writes a work descriptor (LWSpec); every worker kernel in
+// the fixed per-split pipeline guards on spec.active, so the whole tree is
+// one statically-encoded command buffer with zero host round-trips and no
+// indirect dispatches. The host replays the same kernels one split at a
+// time in oracle mode (leafWiseHostDriven) for testing.
 
-struct PartitionParams {
-    uint segStart; uint segCount; uint numSamples; uint numBins;
-    uint samplesPerGroup; uint feature; uint bin; uint flags;
+struct LWParams {
+    uint numLeaves; uint maxDepth; uint samplesPerGroup; uint sliceLen;
+    uint numFeatures; uint numBins; uint numTiles; uint numSamples;
+    float lambda; float learningRate; float minSplitGain; float catSmooth;
 };
 
-inline bool part_left(uchar b, device const uint *mask, constant PartitionParams &p) {
-    if (p.flags & FLAG_CATEGORICAL)
+struct LWOpen {
+    uint node; uint slot; uint segStart; uint count;
+    float G; float H;
+    uint depth; int bestF;          // -1 closed/leaf, -2 eval pending
+    SplitResult best;
+};
+
+struct LWState {
+    uint openCount; uint leaves; uint nextSlot; uint done;
+    uint smallIdx; uint bigIdx; uint pad0; uint pad1;
+};
+
+struct LWSpec {
+    uint segStart; uint segCount; uint feature; uint bin; uint flags;
+    uint active;                    // partition/build/find pipeline runs
+    uint childSlot; uint parentSlot; uint needsZero;
+    uint smallStart; uint smallCount; uint pad;
+};
+
+inline bool part_left(uchar b, device const uint *mask, device const LWSpec *s,
+                      uint numBins) {
+    if (s->flags & FLAG_CATEGORICAL)
         return (mask[b / 32u] >> (b % 32u)) & 1u;
-    if (b == uchar(p.numBins - 1))
-        return (p.flags & FLAG_DEFAULT_LEFT) != 0;
-    return b <= uchar(p.bin);
+    if (b == uchar(numBins - 1))
+        return (s->flags & FLAG_DEFAULT_LEFT) != 0;
+    return b <= uchar(s->bin);
 }
 
 kernel void partition_count(
     device const uchar *bins      [[buffer(0)]],
     device const uint  *order     [[buffer(1)]],
-    device const uint  *mask      [[buffer(2)]],   // 8 words (categorical)
+    device const uint  *mask      [[buffer(2)]],
     device uint        *groupLeft [[buffer(3)]],
-    constant PartitionParams &p   [[buffer(4)]],
+    device const LWSpec *spec     [[buffer(4)]],
+    constant LWParams  &p         [[buffer(5)]],
     uint3 tg [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]])
 {
+    if (!spec->active) return;
     uint g = tg.x;
     uint gStart = g * p.samplesPerGroup;
     threadgroup atomic_uint tot;
     if (tid == 0) atomic_store_explicit(&tot, 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (gStart < p.segCount) {
-        uint gEnd = min(gStart + p.samplesPerGroup, p.segCount);
+    if (gStart < spec->segCount) {
+        uint gEnd = min(gStart + p.samplesPerGroup, spec->segCount);
         uint cnt = 0;
         for (uint sIdx = gStart + tid; sIdx < gEnd; sIdx += TG_SIZE) {
-            uint i = order[p.segStart + sIdx];
-            uchar b = bins[bin_index(p.feature, i, p.numSamples)];
-            if (part_left(b, mask, p)) ++cnt;
+            uint i = order[spec->segStart + sIdx];
+            uchar b = bins[bin_index(spec->feature, i, p.numSamples)];
+            if (part_left(b, mask, spec, p.numBins)) ++cnt;
         }
         atomic_fetch_add_explicit(&tot, cnt, memory_order_relaxed);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) groupLeft[g] = atomic_load_explicit(&tot, memory_order_relaxed);
+    if (tid == 0 && gStart < spec->segCount)
+        groupLeft[g] = atomic_load_explicit(&tot, memory_order_relaxed);
 }
 
 kernel void partition_scan(
-    device uint   *groupLeft [[buffer(0)]],   // in: counts, out: exclusive starts
-    device uint   *totals    [[buffer(1)]],   // [0] = total lefts
-    constant uint &numGroups [[buffer(2)]],
+    device uint         *groupLeft [[buffer(0)]],
+    device uint         *totals    [[buffer(1)]],
+    device const LWSpec *spec      [[buffer(2)]],
+    constant LWParams   &p         [[buffer(3)]],
     uint i [[thread_position_in_grid]])
 {
-    if (i != 0) return;
+    if (i != 0 || !spec->active) return;
+    uint numGroups = (spec->segCount + p.samplesPerGroup - 1) / p.samplesPerGroup;
     uint acc = 0;
     for (uint g = 0; g < numGroups; ++g) {
         uint c = groupLeft[g];
@@ -537,17 +567,19 @@ kernel void partition_scatter(
     device const uchar *bins      [[buffer(0)]],
     device const uint  *order     [[buffer(1)]],
     device const uint  *mask      [[buffer(2)]],
-    device const uint  *groupLeft [[buffer(3)]],   // exclusive starts
+    device const uint  *groupLeft [[buffer(3)]],
     device const uint  *totals    [[buffer(4)]],
-    device uint        *outOrder  [[buffer(5)]],   // scratch, same index space
-    constant PartitionParams &p   [[buffer(6)]],
+    device uint        *outOrder  [[buffer(5)]],
+    device const LWSpec *spec     [[buffer(6)]],
+    constant LWParams  &p         [[buffer(7)]],
     uint3 tg [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]])
 {
+    if (!spec->active) return;
     uint g = tg.x;
     uint gStart = g * p.samplesPerGroup;
-    if (gStart >= p.segCount) return;
-    uint gEnd = min(gStart + p.samplesPerGroup, p.segCount);
+    if (gStart >= spec->segCount) return;
+    uint gEnd = min(gStart + p.samplesPerGroup, spec->segCount);
     uint n = gEnd - gStart;
     uint per = (n + TG_SIZE - 1) / TG_SIZE;
     uint cStart = gStart + min(tid * per, n);
@@ -555,9 +587,9 @@ kernel void partition_scatter(
 
     uint myLeft = 0;
     for (uint sIdx = cStart; sIdx < cEnd; ++sIdx) {
-        uint i = order[p.segStart + sIdx];
-        uchar b = bins[bin_index(p.feature, i, p.numSamples)];
-        if (part_left(b, mask, p)) ++myLeft;
+        uint i = order[spec->segStart + sIdx];
+        uchar b = bins[bin_index(spec->feature, i, p.numSamples)];
+        if (part_left(b, mask, spec, p.numBins)) ++myLeft;
     }
     threadgroup uint lefts[TG_SIZE];
     threadgroup uint lbase[TG_SIZE], rbase[TG_SIZE];
@@ -574,27 +606,488 @@ kernel void partition_scatter(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     uint leftTotal = totals[0];
-    uint lpos = p.segStart + groupLeft[g] + lbase[tid];
-    uint rpos = p.segStart + leftTotal + (gStart - groupLeft[g]) + rbase[tid];
+    uint lpos = spec->segStart + groupLeft[g] + lbase[tid];
+    uint rpos = spec->segStart + leftTotal + (gStart - groupLeft[g]) + rbase[tid];
     for (uint sIdx = cStart; sIdx < cEnd; ++sIdx) {
-        uint i = order[p.segStart + sIdx];
-        uchar b = bins[bin_index(p.feature, i, p.numSamples)];
-        if (part_left(b, mask, p)) outOrder[lpos++] = i;
-        else                       outOrder[rpos++] = i;
+        uint i = order[spec->segStart + sIdx];
+        uchar b = bins[bin_index(spec->feature, i, p.numSamples)];
+        if (part_left(b, mask, spec, p.numBins)) outOrder[lpos++] = i;
+        else                                     outOrder[rpos++] = i;
     }
+}
+
+kernel void copy_region(
+    device const uint   *src  [[buffer(0)]],
+    device uint         *dst  [[buffer(1)]],
+    device const LWSpec *spec [[buffer(2)]],
+    uint j [[thread_position_in_grid]])
+{
+    if (!spec->active || j >= spec->segCount) return;
+    dst[spec->segStart + j] = src[spec->segStart + j];
+}
+
+kernel void zero_slot(
+    device float        *hist [[buffer(0)]],
+    device const LWSpec *spec [[buffer(1)]],
+    constant LWParams   &p    [[buffer(2)]],
+    uint j [[thread_position_in_grid]])
+{
+    if (!spec->active || !spec->needsZero || j >= p.sliceLen) return;
+    hist[(ulong)spec->childSlot * p.sliceLen + j] = 0.0f;
 }
 
 // sibling = parent - child, in place in the parent's histogram slot.
 kernel void subtract_slot(
-    device float       *parent [[buffer(0)]],
-    device const float *child  [[buffer(1)]],
-    constant uint      &len    [[buffer(2)]],
+    device float        *hist [[buffer(0)]],
+    device const LWSpec *spec [[buffer(1)]],
+    constant LWParams   &p    [[buffer(2)]],
     uint j [[thread_position_in_grid]])
 {
-    if (j < len) parent[j] -= child[j];
+    if (!spec->active || j >= p.sliceLen) return;
+    hist[(ulong)spec->parentSlot * p.sliceLen + j] -=
+        hist[(ulong)spec->childSlot * p.sliceLen + j];
 }
 
-// GOSS (gradient-based one-side sampling), LightGBM-style: keep the
+// Reset per-tree device state: heap arrays to "leaf, value 0" and the
+// control state to empty.
+kernel void leaf_reset(
+    device NodeSplit *splits     [[buffer(0)]],
+    device float     *leafValues [[buffer(1)]],
+    device uint      *catMask    [[buffer(2)]],
+    device float     *gains      [[buffer(3)]],
+    device float     *cover      [[buffer(4)]],
+    device LWState   *state      [[buffer(5)]],
+    device LWSpec    *spec       [[buffer(6)]],
+    constant uint    &totalNodes [[buffer(7)]],
+    uint n [[thread_position_in_grid]])
+{
+    if (n < totalNodes) {
+        NodeSplit leaf; leaf.feature = -1; leaf.bin = 0; leaf.flags = 0;
+        splits[n] = leaf;
+        leafValues[n] = 0.0f;
+        gains[n] = 0.0f;
+        cover[n] = 0.0f;
+        for (uint w = 0; w < 8; ++w) catMask[n * 8 + w] = 0u;
+    }
+    if (n == 0) {
+        state->openCount = 0; state->leaves = 0; state->nextSlot = 1;
+        state->done = 0; state->smallIdx = 0; state->bigIdx = 0;
+        spec->active = 0;
+    }
+}
+
+// After the root's histogram + find: totals, root leaf value, open[0].
+kernel void leaf_init(
+    device const SplitResult *results [[buffer(0)]],
+    device const float *hist          [[buffer(1)]],   // slot 0
+    device LWOpen  *open              [[buffer(2)]],
+    device LWState *state             [[buffer(3)]],
+    device float   *leafValues        [[buffer(4)]],
+    device float   *cover             [[buffer(5)]],
+    device float2  *bounds            [[buffer(6)]],
+    device const uint *rootCount      [[buffer(7)]],
+    constant LWParams &p              [[buffer(8)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid != 0) return;
+    float G = 0.0f, H = 0.0f, C = 0.0f;
+    for (uint b = 0; b < p.numBins; ++b) {
+        G += hist[b*HIST_CH]; H += hist[b*HIST_CH+1]; C += hist[b*HIST_CH+2];
+    }
+    int bestF = -1;
+    SplitResult best;
+    best.gain = -INFINITY; best.bin = 0; best.gl = 0; best.hl = 0; best.flags = 0;
+    for (uint f = 0; f < p.numFeatures; ++f) {
+        SplitResult r = results[f];
+        if (r.gain > best.gain) { best = r; bestF = int(f); }
+    }
+    bounds[0] = float2(-FLT_MAX, FLT_MAX);
+    leafValues[0] = p.learningRate * clamp(-G / (H + p.lambda), -FLT_MAX, FLT_MAX);
+    cover[0] = C;
+    LWOpen root;
+    root.node = 0; root.slot = 0; root.segStart = 0; root.count = rootCount[0];
+    root.G = G; root.H = H; root.depth = 0; root.bestF = bestF; root.best = best;
+    open[0] = root;
+    state->openCount = 1;
+    state->leaves = 1;
+}
+
+// Pick the best open leaf and apply its split; describe the next
+// pipeline's work in spec (or deactivate everything when finished).
+kernel void leaf_pick_apply(
+    device LWOpen  *open        [[buffer(0)]],
+    device LWState *state       [[buffer(1)]],
+    device const float *hist    [[buffer(2)]],   // pool base
+    device const SplitResult *results [[buffer(14)]],
+    device NodeSplit *splits    [[buffer(3)]],
+    device float   *leafValues  [[buffer(4)]],
+    device uint    *catMask     [[buffer(5)]],
+    device float   *gains       [[buffer(6)]],
+    device float   *cover       [[buffer(7)]],
+    device float2  *bounds      [[buffer(8)]],
+    device const char *monotone [[buffer(9)]],
+    device uint    *mask8       [[buffer(10)]],
+    device LWSpec  *spec        [[buffer(11)]],
+    device uint    *slotMap     [[buffer(12)]],  // [0]=child slot [1]=parent slot
+    device uint    *segIO       [[buffer(13)]],  // [0]=build segStart [1]=build count
+    constant LWParams &p        [[buffer(15)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid != 0) return;
+    // Fold the previous split's find results into its two pending leaves
+    // (replaces a separate collect dispatch per split).
+    if (spec->active) {
+        uint idxs[2] = { state->smallIdx, state->bigIdx };
+        for (uint row = 0; row < 2; ++row) {
+            uint oi = idxs[row];
+            if (open[oi].bestF != -2) continue;
+            int cf = -1;
+            SplitResult cbest;
+            cbest.gain = -INFINITY; cbest.bin = 0; cbest.gl = 0; cbest.hl = 0;
+            cbest.flags = 0;
+            for (uint f = 0; f < p.numFeatures; ++f) {
+                SplitResult r = results[row * p.numFeatures + f];
+                if (r.gain > cbest.gain) { cbest = r; cf = int(f); }
+            }
+            open[oi].bestF = cf;
+            open[oi].best = cbest;
+        }
+    }
+    spec->active = 0;
+    segIO[1] = 0;                       // build_histograms sees count 0 when idle
+    if (state->done != 0 || state->leaves >= p.numLeaves) { state->done = 1; return; }
+
+    int bi = -1;
+    float bg = p.minSplitGain;
+    for (uint i = 0; i < state->openCount; ++i) {
+        if (open[i].bestF >= 0 && isfinite(open[i].best.gain)
+            && open[i].best.gain > bg) {
+            bg = open[i].best.gain; bi = int(i);
+        }
+    }
+    if (bi < 0) { state->done = 1; return; }
+    LWOpen L = open[bi];
+
+    int bestF = L.bestF;
+    SplitResult best = L.best;
+    device const float *h =
+        hist + (((ulong)L.slot * p.numFeatures + uint(bestF)) * p.numBins) * HIST_CH;
+
+    float leftCount = 0.0f;
+    uint m8[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    if (best.flags & FLAG_CATEGORICAL) {
+        ushort order_[256]; float key[256];
+        cat_sort(h, p.numBins, p.catSmooth, order_, key);
+        for (uint i2 = 0; i2 < best.bin; ++i2) {
+            uint b = order_[i2];
+            m8[b >> 5] |= (1u << (b & 31u));
+            leftCount += h[b*HIST_CH+2];
+        }
+    } else {
+        for (uint b = 0; b <= best.bin; ++b) leftCount += h[b*HIST_CH+2];
+        if (best.flags & FLAG_DEFAULT_LEFT)
+            leftCount += h[(p.numBins-1)*HIST_CH+2];
+    }
+    NodeSplit ns; ns.feature = bestF; ns.bin = best.bin; ns.flags = best.flags;
+    splits[L.node] = ns;
+    gains[L.node] = best.gain;
+    for (uint w = 0; w < 8; ++w) {
+        catMask[L.node * 8u + w] = m8[w];
+        mask8[w] = m8[w];
+    }
+
+    uint lcNode = 2 * L.node + 1, rcNode = 2 * L.node + 2;
+    float lG = best.gl, lH = best.hl;
+    float rG = L.G - lG, rH = L.H - lH;
+    uint lCount = uint(leftCount);
+    uint rCount = L.count - lCount;
+    float2 pb = bounds[L.node];
+    float2 lb = pb, rb = pb;
+    int cst = (best.flags & FLAG_CATEGORICAL) ? 0 : int(monotone[bestF]);
+    if (cst != 0) {
+        float vl = -lG / (lH + p.lambda);
+        float vr = -rG / (rH + p.lambda);
+        float mid = clamp(0.5f * (vl + vr), pb.x, pb.y);
+        if (cst > 0) { lb.y = min(lb.y, mid); rb.x = max(rb.x, mid); }
+        else         { lb.x = max(lb.x, mid); rb.y = min(rb.y, mid); }
+    }
+    bounds[lcNode] = lb;
+    bounds[rcNode] = rb;
+    cover[lcNode] = leftCount;
+    cover[rcNode] = float(rCount);
+    leafValues[lcNode] = p.learningRate * clamp(-lG / (lH + p.lambda), lb.x, lb.y);
+    leafValues[rcNode] = p.learningRate * clamp(-rG / (rH + p.lambda), rb.x, rb.y);
+
+    uint childDepth = L.depth + 1;
+    bool canEval = childDepth < p.maxDepth && state->leaves + 1 < p.numLeaves
+        && lCount > 0 && rCount > 0;
+    bool leftBuilds = lCount <= rCount;
+
+    uint i0 = state->openCount;
+    uint i1 = state->openCount + 1;
+    state->openCount += 2;
+    state->leaves += 1;
+    open[bi].bestF = -1;
+    open[bi].best.gain = -INFINITY;
+
+    LWOpen cl;
+    cl.node = lcNode; cl.segStart = L.segStart; cl.count = lCount;
+    cl.G = lG; cl.H = lH; cl.depth = childDepth;
+    cl.bestF = canEval ? -2 : -1;
+    cl.best.gain = -INFINITY; cl.best.bin = 0; cl.best.gl = 0; cl.best.hl = 0;
+    cl.best.flags = 0;
+    LWOpen cr = cl;
+    cr.node = rcNode; cr.segStart = L.segStart + lCount; cr.count = rCount;
+    cr.G = rG; cr.H = rH;
+
+    if (canEval) {
+        uint newSlot = state->nextSlot;
+        state->nextSlot += 1;
+        if (leftBuilds) { cl.slot = newSlot; cr.slot = L.slot; }
+        else            { cr.slot = newSlot; cl.slot = L.slot; }
+        spec->segStart = L.segStart; spec->segCount = L.count;
+        spec->feature = uint(bestF); spec->bin = best.bin;
+        spec->flags = best.flags;
+        spec->childSlot = newSlot;
+        spec->parentSlot = L.slot;
+        spec->smallStart = leftBuilds ? cl.segStart : cr.segStart;
+        spec->smallCount = leftBuilds ? cl.count : cr.count;
+        spec->needsZero = spec->smallCount > p.samplesPerGroup ? 1u : 0u;
+        spec->active = 1;
+        slotMap[0] = newSlot;
+        slotMap[1] = L.slot;
+        segIO[0] = spec->smallStart;
+        segIO[1] = spec->smallCount;
+        state->smallIdx = leftBuilds ? i0 : i1;
+        state->bigIdx = leftBuilds ? i1 : i0;
+    } else {
+        cl.slot = 0; cr.slot = 0;
+    }
+    open[i0] = cl;
+    open[i1] = cr;
+}
+
+// Fused per-split step for single-threadgroup segments (rows small
+// enough that every segment fits one group): thread 0 folds the previous
+// find results, picks and applies the best split; then the whole group
+// partitions the split leaf's order segment in place. Replaces four
+// dispatches (pick, count, scan, scatter+copy) with one, eliminating the
+// single-thread pipeline bubbles that dominate small-split cost.
+kernel void leaf_step(
+    device LWOpen  *open        [[buffer(0)]],
+    device LWState *state       [[buffer(1)]],
+    device const float *hist    [[buffer(2)]],
+    device NodeSplit *splits    [[buffer(3)]],
+    device float   *leafValues  [[buffer(4)]],
+    device uint    *catMask     [[buffer(5)]],
+    device float   *gains       [[buffer(6)]],
+    device float   *cover       [[buffer(7)]],
+    device float2  *bounds      [[buffer(8)]],
+    device const char *monotone [[buffer(9)]],
+    device uint    *mask8       [[buffer(10)]],
+    device LWSpec  *spec        [[buffer(11)]],
+    device uint    *slotMap     [[buffer(12)]],
+    device uint    *segIO       [[buffer(13)]],
+    device const SplitResult *results [[buffer(14)]],
+    device const uchar *bins    [[buffer(15)]],
+    device uint    *order       [[buffer(16)]],
+    device uint    *scratch     [[buffer(17)]],
+    device float4  *stats       [[buffer(18)]],
+    device uint    *argsBuild   [[buffer(19)]],   // 3 uints each: tg counts
+    device uint    *argsSub     [[buffer(20)]],
+    device uint    *argsFind    [[buffer(21)]],
+    constant LWParams &p        [[buffer(22)]],
+    uint tid [[thread_index_in_threadgroup]])
+{
+    if (tid == 0) {
+        // --- pick + apply (same logic as leaf_pick_apply) ---
+        if (spec->active) {
+            uint idxs[2] = { state->smallIdx, state->bigIdx };
+            for (uint row = 0; row < 2; ++row) {
+                uint oi = idxs[row];
+                if (open[oi].bestF == -2) {
+                    int cf = -1;
+                    SplitResult cbest;
+                    cbest.gain = -INFINITY; cbest.bin = 0; cbest.gl = 0;
+                    cbest.hl = 0; cbest.flags = 0;
+                    for (uint f = 0; f < p.numFeatures; ++f) {
+                        SplitResult r = results[row * p.numFeatures + f];
+                        if (r.gain > cbest.gain) { cbest = r; cf = int(f); }
+                    }
+                    open[oi].bestF = cf;
+                    open[oi].best = cbest;
+                }
+            }
+        }
+        spec->active = 0;
+        segIO[1] = 0;
+        stats[1] = float4(0, 0, 0, 0);
+        stats[2] = float4(0, 0, 0, 0);
+        // Idle iterations dispatch ZERO threadgroups downstream.
+        argsBuild[0] = 0; argsBuild[1] = 0; argsBuild[2] = 0;
+        argsSub[0] = 0; argsSub[1] = 1; argsSub[2] = 1;
+        argsFind[0] = 0; argsFind[1] = 1; argsFind[2] = 1;
+        if (state->done != 0 || state->leaves >= p.numLeaves) {
+            state->done = 1;
+        } else {
+            int bi = -1;
+            float bg = p.minSplitGain;
+            for (uint i = 0; i < state->openCount; ++i) {
+                if (open[i].bestF >= 0 && isfinite(open[i].best.gain)
+                    && open[i].best.gain > bg) {
+                    bg = open[i].best.gain; bi = int(i);
+                }
+            }
+            if (bi < 0) {
+                state->done = 1;
+            } else {
+                LWOpen L = open[bi];
+                int bestF = L.bestF;
+                SplitResult best = L.best;
+                device const float *h = hist
+                    + (((ulong)L.slot * p.numFeatures + uint(bestF)) * p.numBins) * HIST_CH;
+                float leftCount = 0.0f;
+                uint m8[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                if (best.flags & FLAG_CATEGORICAL) {
+                    ushort order_[256]; float key[256];
+                    cat_sort(h, p.numBins, p.catSmooth, order_, key);
+                    for (uint i2 = 0; i2 < best.bin; ++i2) {
+                        uint b = order_[i2];
+                        m8[b >> 5] |= (1u << (b & 31u));
+                        leftCount += h[b*HIST_CH+2];
+                    }
+                } else {
+                    for (uint b = 0; b <= best.bin; ++b) leftCount += h[b*HIST_CH+2];
+                    if (best.flags & FLAG_DEFAULT_LEFT)
+                        leftCount += h[(p.numBins-1)*HIST_CH+2];
+                }
+                NodeSplit ns; ns.feature = bestF; ns.bin = best.bin; ns.flags = best.flags;
+                splits[L.node] = ns;
+                gains[L.node] = best.gain;
+                for (uint w = 0; w < 8; ++w) {
+                    catMask[L.node * 8u + w] = m8[w];
+                    mask8[w] = m8[w];
+                }
+                uint lcNode = 2 * L.node + 1, rcNode = 2 * L.node + 2;
+                float lG = best.gl, lH = best.hl;
+                float rG = L.G - lG, rH = L.H - lH;
+                uint lCount = uint(leftCount);
+                uint rCount = L.count - lCount;
+                float2 pb = bounds[L.node];
+                float2 lb = pb, rb = pb;
+                int cst = (best.flags & FLAG_CATEGORICAL) ? 0 : int(monotone[bestF]);
+                if (cst != 0) {
+                    float vl = -lG / (lH + p.lambda);
+                    float vr = -rG / (rH + p.lambda);
+                    float mid = clamp(0.5f * (vl + vr), pb.x, pb.y);
+                    if (cst > 0) { lb.y = min(lb.y, mid); rb.x = max(rb.x, mid); }
+                    else         { lb.x = max(lb.x, mid); rb.y = min(rb.y, mid); }
+                }
+                bounds[lcNode] = lb;
+                bounds[rcNode] = rb;
+                cover[lcNode] = leftCount;
+                cover[rcNode] = float(rCount);
+                leafValues[lcNode] = p.learningRate * clamp(-lG / (lH + p.lambda), lb.x, lb.y);
+                leafValues[rcNode] = p.learningRate * clamp(-rG / (rH + p.lambda), rb.x, rb.y);
+                uint childDepth = L.depth + 1;
+                bool canEval = childDepth < p.maxDepth
+                    && state->leaves + 1 < p.numLeaves && lCount > 0 && rCount > 0;
+                bool leftBuilds = lCount <= rCount;
+                uint i0 = state->openCount;
+                uint i1 = state->openCount + 1;
+                state->openCount += 2;
+                state->leaves += 1;
+                open[bi].bestF = -1;
+                open[bi].best.gain = -INFINITY;
+                LWOpen cl;
+                cl.node = lcNode; cl.segStart = L.segStart; cl.count = lCount;
+                cl.G = lG; cl.H = lH; cl.depth = childDepth;
+                cl.bestF = canEval ? -2 : -1;
+                cl.best.gain = -INFINITY; cl.best.bin = 0; cl.best.gl = 0;
+                cl.best.hl = 0; cl.best.flags = 0;
+                cl.slot = 0;
+                LWOpen cr = cl;
+                cr.node = rcNode; cr.segStart = L.segStart + lCount; cr.count = rCount;
+                cr.G = rG; cr.H = rH;
+                if (canEval) {
+                    uint newSlot = state->nextSlot;
+                    state->nextSlot += 1;
+                    if (leftBuilds) { cl.slot = newSlot; cr.slot = L.slot; }
+                    else            { cr.slot = newSlot; cl.slot = L.slot; }
+                    spec->segStart = L.segStart; spec->segCount = L.count;
+                    spec->feature = uint(bestF); spec->bin = best.bin;
+                    spec->flags = best.flags;
+                    spec->childSlot = newSlot;
+                    spec->parentSlot = L.slot;
+                    spec->smallStart = leftBuilds ? cl.segStart : cr.segStart;
+                    spec->smallCount = leftBuilds ? cl.count : cr.count;
+                    spec->needsZero = spec->smallCount > p.samplesPerGroup ? 1u : 0u;
+                    spec->active = 1;
+                    slotMap[0] = newSlot;
+                    slotMap[1] = L.slot;
+                    segIO[0] = spec->smallStart;
+                    segIO[1] = spec->smallCount;
+                    state->smallIdx = leftBuilds ? i0 : i1;
+                    state->bigIdx = leftBuilds ? i1 : i0;
+                    stats[1] = float4(0, 0, 1, 0);
+                    stats[2] = float4(0, 0, 1, 0);
+                    argsBuild[0] = (spec->smallCount + p.samplesPerGroup - 1)
+                        / p.samplesPerGroup;
+                    argsBuild[1] = p.numTiles; argsBuild[2] = 1;
+                    argsSub[0] = (p.sliceLen + TG_SIZE - 1) / TG_SIZE;
+                    argsSub[1] = 1; argsSub[2] = 1;
+                    argsFind[0] = (p.numFeatures + TG_SIZE - 1) / TG_SIZE;
+                    argsFind[1] = 2; argsFind[2] = 1;
+                }
+                open[i0] = cl;
+                open[i1] = cr;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // --- single-group stable partition of the split segment ---
+    if (!spec->active) return;
+    uint segStart = spec->segStart, n = spec->segCount;
+    uint per = (n + TG_SIZE - 1) / TG_SIZE;
+    uint cStart = min(tid * per, n);
+    uint cEnd = min((tid + 1) * per, n);
+    uint myLeft = 0;
+    for (uint sIdx = cStart; sIdx < cEnd; ++sIdx) {
+        uint i = order[segStart + sIdx];
+        uchar b = bins[bin_index(spec->feature, i, p.numSamples)];
+        if (part_left(b, mask8, spec, p.numBins)) ++myLeft;
+    }
+    threadgroup uint lefts[TG_SIZE];
+    threadgroup uint lbase[TG_SIZE], rbase[TG_SIZE];
+    threadgroup uint totalLeft;
+    lefts[tid] = myLeft;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        uint la = 0, ra = 0;
+        for (uint t2 = 0; t2 < TG_SIZE; ++t2) {
+            uint tn = min((t2 + 1) * per, n) - min(t2 * per, n);
+            lbase[t2] = la; rbase[t2] = ra;
+            la += lefts[t2]; ra += tn - lefts[t2];
+        }
+        totalLeft = la;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint lpos = segStart + lbase[tid];
+    uint rpos = segStart + totalLeft + rbase[tid];
+    for (uint sIdx = cStart; sIdx < cEnd; ++sIdx) {
+        uint i = order[segStart + sIdx];
+        uchar b = bins[bin_index(spec->feature, i, p.numSamples)];
+        if (part_left(b, mask8, spec, p.numBins)) scratch[lpos++] = i;
+        else                                      scratch[rpos++] = i;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    for (uint sIdx = tid; sIdx < n; sIdx += TG_SIZE) {
+        order[segStart + sIdx] = scratch[segStart + sIdx];
+    }
+}
+
+// GOSS (gradient-based one-side sampling), LightGBM-style: keep the// GOSS (gradient-based one-side sampling), LightGBM-style: keep the
 // top-rate fraction of samples by |gradient| plus a uniform sample of the
 // rest, amplifying the latter's gradients by (1-a)/b. The threshold is the
 // approximate top-rate quantile from a 1024-bucket |g| histogram; kept

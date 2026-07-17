@@ -199,6 +199,23 @@ final class LeafWiseTests: XCTestCase {
                           1.3, "valid RMSE at noise floor")
     }
 
+    /// Rows above the single-threadgroup threshold exercise the
+    /// multi-dispatch split pipeline (partition_count/scan/scatter,
+    /// zero_slot) instead of the fused leaf_step path.
+    func testLargeRowPath() throws {
+        let rows = 300_000
+        let (X, y) = DataGen.friedman(rows: rows, cols: 5, seed: 581)
+        var p = BoosterParams()
+        p.numTrees = 30; p.maxDepth = 10; p.numLeaves = 31
+        let b = try MacBooster(params: p)
+        try b.fit(featureMajor: X, rows: rows, cols: 5, labels: y)
+        let pred = b.predict(featureMajor: X, rows: rows, cols: 5)
+        var s: Float = 0
+        for i in 0..<rows { let d = pred[i] - y[i]; s += d * d }
+        let r = (s / Float(rows)).squareRoot()
+        XCTAssertLessThan(r, 1.6, "large-row leaf-wise RMSE \(r)")
+    }
+
     func testValidation() throws {
         var p = BoosterParams()
         p.maxDepth = 4; p.numLeaves = 17    // > 2^4

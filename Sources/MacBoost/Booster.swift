@@ -156,9 +156,18 @@ private struct DecideParams {
 private struct FinalParams {
     var lastStart: UInt32; var numLast: UInt32; var lambda: Float; var learningRate: Float
 }
-private struct PartitionParams {
-    var segStart: UInt32; var segCount: UInt32; var numSamples: UInt32; var numBins: UInt32
-    var samplesPerGroup: UInt32; var feature: UInt32; var bin: UInt32; var flags: UInt32
+private struct LWParamsHost {
+    var numLeaves: UInt32; var maxDepth: UInt32; var samplesPerGroup: UInt32
+    var sliceLen: UInt32; var numFeatures: UInt32; var numBins: UInt32
+    var numTiles: UInt32; var numSamples: UInt32
+    var lambda: Float; var learningRate: Float; var minSplitGain: Float; var catSmooth: Float
+}
+
+private struct LWSpecHost {
+    var segStart: UInt32 = 0; var segCount: UInt32 = 0; var feature: UInt32 = 0
+    var bin: UInt32 = 0; var flags: UInt32 = 0; var active: UInt32 = 0
+    var childSlot: UInt32 = 0; var parentSlot: UInt32 = 0; var needsZero: UInt32 = 0
+    var smallStart: UInt32 = 0; var smallCount: UInt32 = 0; var pad: UInt32 = 0
 }
 
 private struct ZeroBuiltParams {
@@ -640,6 +649,17 @@ public final class MacBooster {
         let leafSegStartBuf = engine.makeBuffer(length: 16)
         let leafSegCountBuf = engine.makeBuffer(length: 16)
         let leafMaskBuf = engine.makeBuffer(length: 32)
+        let lwSpecBuf = engine.makeBuffer(length: MemoryLayout<LWSpecHost>.stride)
+        let lwStateBuf = engine.makeBuffer(length: 32)
+        let lwOpenBuf = engine.makeBuffer(length: max(16, (2 * numLeaves + 2) * 52))
+        let lwSlotMapBuf = engine.makeBuffer(length: 16)
+        let lwSegIOBuf = engine.makeBuffer(length: 16)
+        let lwArgsBuild = engine.makeBuffer(length: 16)
+        let lwArgsSub = engine.makeBuffer(length: 16)
+        let lwArgsFind = engine.makeBuffer(length: 16)
+        let lwDeltaBuf = engine.makeBuffer(length: max(16, totalNodes * 4))
+        let nodeSlotIdentBuf = engine.makeBuffer(
+            (0..<UInt32(max(1, maxBuildNodes))).map { $0 })
 
         let predsPtr = predsBuf.contents().bindMemory(to: Float.self, capacity: rows * K)
 
@@ -849,101 +869,38 @@ public final class MacBooster {
             }
         }
 
-        // --- Leaf-wise (best-first) growth: host-driven v1 -----------------
-        // One command buffer per split; the host reads split candidates
-        // through unified memory and replicates decide_splits' apply logic
-        // (cat-mask reconstruction, child stats, monotone bounds). Trees
-        // stay heap-embedded so every downstream consumer is unchanged.
-        let negBound = -Float.greatestFiniteMagnitude
-        let posBound = Float.greatestFiniteMagnitude
+        // --- Leaf-wise (best-first) growth: device-driven -------------------
+        // leaf_pick_apply chooses each split on-device and describes the
+        // per-split pipeline's work in a spec buffer; every worker kernel
+        // guards on it, so a whole tree is one statically-encoded command
+        // buffer with no host round-trips and no indirect dispatches. Tree
+        // structures come back through the same pipelined readback as
+        // level-wise.
+        let lwSpgEarly = rows <= 262_144 ? rows : samplesPerGroup
+        let lwParams = LWParamsHost(
+            numLeaves: UInt32(numLeaves), maxDepth: UInt32(maxDepth),
+            samplesPerGroup: UInt32(lwSpgEarly), sliceLen: UInt32(sliceLen),
+            numFeatures: UInt32(cols), numBins: UInt32(nBins),
+            numTiles: UInt32(numTiles), numSamples: UInt32(rows),
+            lambda: lambda, learningRate: lr,
+            minSplitGain: params.minSplitGain, catSmooth: params.catSmooth)
+        let lwSpg = lwSpgEarly
+        let maxSegGroups = (rows + lwSpg - 1) / lwSpg
         func growLeafWiseTree(t: Int, classIdx: Int) throws {
-            // Gradients + optional sampling + quantisation, then the order
-            // buffer is initialised (identity, or the sampled compaction).
             gossActive = params.goss && t >= gossWarmup
             let bagging = params.subsample < 1
             let samplingActive = gossActive || bagging
             treeSampled = samplingActive
             let activeMax = samplingActive ? maxWGHBuf : maxGHBuf
-            do {
-                let cb = engine.queue.makeCommandBuffer()!
-                var e = engine.beginCompute(cb)
-                e.zero(maxGHBuf, length: 8)
-                if K > 1 {
-                    e.dispatch("compute_gradients_multiclass",
-                               buffers: [predsBuf, labelsBuf, weightsBuf, ghBuf, maxGHBuf],
-                               params: GradMCParams(numSamples: UInt32(rows),
-                                                    numClasses: UInt32(K),
-                                                    classIndex: UInt32(classIdx),
-                                                    hasWeights: hasWeights),
-                               grid: rowGrid, threadgroup: tg1D)
-                } else {
-                    let aux: Float
-                    switch params.objective {
-                    case .binaryLogistic: aux = params.scalePosWeight
-                    case .tweedie: aux = params.tweedieVariancePower
-                    default: aux = 0
-                    }
-                    e.dispatch("compute_gradients",
-                               buffers: [predsBuf, labelsBuf, weightsBuf, ghBuf, maxGHBuf],
-                               params: GradParams(numSamples: UInt32(rows),
-                                                  objective: params.objective.rawValue,
-                                                  alpha: params.alpha, aux: aux,
-                                                  hasWeights: hasWeights),
-                               grid: rowGrid, threadgroup: tg1D)
-                }
-                if samplingActive {
-                    e.zero(gossCursorBuf, length: 4)
-                    e.zero(maxWGHBuf, length: 8)
-                    if gossActive {
-                        e.zero(gossBucketsBuf, length: 1024 * 4)
-                        e.dispatch("goss_grad_hist",
-                                   buffers: [ghBuf, maxGHBuf, gossBucketsBuf],
-                                   params: UInt32(rows), grid: rowGrid, threadgroup: tg1D)
-                        e.dispatch("goss_threshold",
-                                   buffers: [gossBucketsBuf, maxGHBuf, gossThresholdBuf],
-                                   params: UInt32(Float(rows) * params.gossTopRate),
-                                   grid: MTLSize(width: 1, height: 1, depth: 1),
-                                   threadgroup: MTLSize(width: 1, height: 1, depth: 1))
-                    } else {
-                        e.dispatch("goss_threshold",
-                                   buffers: [gossBucketsBuf, maxGHBuf, gossThresholdBuf],
-                                   params: UInt32(0),
-                                   grid: MTLSize(width: 1, height: 1, depth: 1),
-                                   threadgroup: MTLSize(width: 1, height: 1, depth: 1))
-                    }
-                    let otherProb = gossActive
-                        ? params.gossOtherRate / (1 - params.gossTopRate)
-                        : params.subsample
-                    e.dispatch("goss_select",
-                               buffers: [ghBuf, gossThresholdBuf, orderBBuf,
-                                         gossCursorBuf, maxWGHBuf],
-                               params: GossParams(numSamples: UInt32(rows),
-                                                  treeSeed: UInt32(t / K &+ 1),
-                                                  otherProb: otherProb,
-                                                  weight: gossActive ? gossWeight : 1),
-                               grid: rowGrid, threadgroup: tg1D)
-                }
-                e.dispatch("quantize_gradients",
-                           buffers: [ghBuf, activeMax, ghqBuf],
-                           params: QuantParams(numSamples: UInt32(rows)),
-                           grid: rowGrid, threadgroup: tg1D)
-                e.end()
-                if samplingActive {
-                    engine.copyBuffer(cb, from: orderBBuf, srcOffset: 0,
-                                      to: orderABuf, dstOffset: 0, length: rows * 4)
-                } else {
-                    engine.dispatch(cb, "iota", buffers: [orderABuf],
-                                    params: UInt32(rows), grid: rowGrid, threadgroup: tg1D)
-                }
-                cb.commit()
-                cb.waitUntilCompleted()
-            }
-            let rootCount = samplingActive
-                ? Int(gossCursorBuf.contents().bindMemory(to: UInt32.self, capacity: 1)[0])
-                : rows
-
+            let k = t % pipelineDepth
+            let nodeSplitsBuf = nodeSplitsBufs[k]
+            let leafValuesBuf = leafValuesBufs[k]
+            let catMaskBuf = catMaskBufs[k]
+            let gainsBuf = gainsBufs[k]
+            let coverBuf = coverBufs[k]
+            let featMaskBuf = featMaskBufs[colsampling ? k : 0]
             if colsampling {
-                let maskPtr = featMaskBufs[0].contents().bindMemory(to: UInt8.self, capacity: cols)
+                let maskPtr = featMaskBuf.contents().bindMemory(to: UInt8.self, capacity: cols)
                 var rng = SplitMix64(seed: 0xC0150001 &+ UInt64(t) &* 0x9E3779B97F4A7C15)
                 var any = false
                 for f in 0..<cols {
@@ -957,333 +914,268 @@ public final class MacBooster {
                     maskPtr[candidates[Int(rng.next() % UInt64(candidates.count))]] = 1
                 }
             }
-
-            // Host-side tree state (heap layout, identical to readback).
-            var tFeature = [Int32](repeating: -1, count: totalNodes)
-            var tBin = [UInt32](repeating: 0, count: totalNodes)
-            var tThreshold = [Float](repeating: 0, count: totalNodes)
-            var tLeaf = [Float](repeating: 0, count: totalNodes)
-            var tFlags = [UInt8](repeating: 0, count: totalNodes)
-            var tGain = [Float](repeating: 0, count: totalNodes)
-            var tCover = [Float](repeating: 0, count: totalNodes)
-            var tMask = [UInt32](repeating: 0, count: hasCats ? totalNodes * 8 : 8)
-            var nodeBounds = [SIMD2<Float>](
-                repeating: SIMD2(negBound, posBound), count: totalNodes)
-
-            let poolPtr = histPoolBuf.contents()
-                .bindMemory(to: Float.self, capacity: (numLeaves + 1) * sliceLen)
-            func histSlice(_ slot: Int, _ f: Int) -> UnsafeMutablePointer<Float> {
-                poolPtr + slot * sliceLen + f * nBins * histChannels
+            if !samplingActive {
+                leafSegCountBuf.contents()
+                    .bindMemory(to: UInt32.self, capacity: 1)[0] = UInt32(rows)
             }
-            let resPtr = splitResBuf.contents()
-                .bindMemory(to: SplitResult.self, capacity: 2 * cols)
-            let segStartPtr = leafSegStartBuf.contents().bindMemory(to: UInt32.self, capacity: 1)
-            let segCountPtr = leafSegCountBuf.contents().bindMemory(to: UInt32.self, capacity: 1)
-            let maskWords = leafMaskBuf.contents().bindMemory(to: UInt32.self, capacity: 8)
+            leafSegStartBuf.contents().bindMemory(to: UInt32.self, capacity: 1)[0] = 0
 
-            /// Encode histogram build + split search for one leaf slot.
-            func encodeBuildFind(_ cb: MTLCommandBuffer, slot: Int, segStart: Int,
-                                 count: Int, resultRow: Int) {
-                segStartPtr[0] = UInt32(segStart)
-                segCountPtr[0] = UInt32(count)
-                let slotBytes = slot * sliceLen * 4
-                if count > samplesPerGroup {
-                    engine.dispatch(cb, "zero_buffer", buffers: [histPoolBuf],
-                                    params: UInt32(sliceLen),
-                                    grid: MTLSize(width: sliceLen, height: 1, depth: 1),
-                                    threadgroup: tg1D, offsets: [slotBytes])
+            let cb = engine.queue.makeCommandBuffer()!
+            var e = engine.beginCompute(cb)
+            e.zero(maxGHBuf, length: 8)
+            if K > 1 {
+                e.dispatch("compute_gradients_multiclass",
+                           buffers: [predsBuf, labelsBuf, weightsBuf, ghBuf, maxGHBuf],
+                           params: GradMCParams(numSamples: UInt32(rows),
+                                                numClasses: UInt32(K),
+                                                classIndex: UInt32(classIdx),
+                                                hasWeights: hasWeights),
+                           grid: rowGrid, threadgroup: tg1D)
+            } else {
+                let aux: Float
+                switch params.objective {
+                case .binaryLogistic: aux = params.scalePosWeight
+                case .tweedie: aux = params.tweedieVariancePower
+                default: aux = 0
                 }
-                let groups = (count + samplesPerGroup - 1) / samplesPerGroup
-                engine.dispatch(cb, "build_histograms",
-                                buffers: [binsBuf, ghqBuf, orderABuf,
-                                          leafSegStartBuf, leafSegCountBuf,
-                                          histPoolBuf, activeMax],
-                                params: HistParams(numSamples: UInt32(rows),
-                                                   numFeatures: UInt32(cols),
-                                                   numBins: UInt32(nBins),
-                                                   numNodes: 1,
-                                                   samplesPerGroup: UInt32(samplesPerGroup)),
-                                grid: MTLSize(width: groups, height: numTiles, depth: 1),
-                                threadgroup: tg1D, threadgroupGrid: true,
-                                offsets: [0, 0, 0, 0, 0, slotBytes, 0])
-                encodeFind(cb, slot: slot, resultRow: resultRow)
+                e.dispatch("compute_gradients",
+                           buffers: [predsBuf, labelsBuf, weightsBuf, ghBuf, maxGHBuf],
+                           params: GradParams(numSamples: UInt32(rows),
+                                              objective: params.objective.rawValue,
+                                              alpha: params.alpha, aux: aux,
+                                              hasWeights: hasWeights),
+                           grid: rowGrid, threadgroup: tg1D)
             }
-            func encodeFind(_ cb: MTLCommandBuffer, slot: Int, resultRow: Int) {
-                engine.dispatch(cb, "find_splits",
-                                buffers: [histPoolBuf, featFlagsBuf, featMaskBufs[0],
-                                          monotoneBuf, splitResBuf, statsBuf],
-                                params: SplitParams(numFeatures: UInt32(cols),
-                                                    numBins: UInt32(nBins),
-                                                    numNodes: 1,
-                                                    lambda: lambda,
-                                                    minChildHess: params.minChildHess,
-                                                    minSplitGain: params.minSplitGain,
-                                                    catSmooth: params.catSmooth,
-                                                    levelStart: 0),
-                                grid: MTLSize(width: cols, height: 1, depth: 1),
-                                threadgroup: tg1D,
-                                offsets: [slot * sliceLen * 4, 0, 0, 0,
-                                          resultRow * cols * MemoryLayout<SplitResult>.stride, 0])
-            }
-            func readBest(resultRow: Int) -> (f: Int, r: SplitResult) {
-                var bestF = -1
-                var best = SplitResult(gain: -.infinity, bin: 0, gl: 0, hl: 0, flags: 0)
-                for f in 0..<cols {
-                    let r = resPtr[resultRow * cols + f]
-                    if r.gain > best.gain { best = r; bestF = f }
-                }
-                return (bestF, best)
-            }
-            /// Mirror of MSL cat_sort: stable insertion sort of non-empty
-            /// bins by g/(h + catSmooth), ascending.
-            func catSortHost(_ h: UnsafePointer<Float>) -> [Int] {
-                var order: [Int] = []
-                var key: [Float] = []
-                for b in 0..<nBins where h[b * histChannels + 1] > 0 {
-                    order.append(b)
-                    key.append(h[b * histChannels] / (h[b * histChannels + 1] + params.catSmooth))
-                }
-                var i = 1
-                while i < order.count {
-                    let ob = order[i]; let ok = key[i]
-                    var j = i - 1
-                    while j >= 0 && key[j] > ok {
-                        key[j + 1] = key[j]; order[j + 1] = order[j]; j -= 1
-                    }
-                    key[j + 1] = ok; order[j + 1] = ob
-                    i += 1
-                }
-                return order
-            }
-
-            struct OpenLeaf {
-                var node: Int; var slot: Int; var segStart: Int; var count: Int
-                var G: Float; var H: Float; var depth: Int
-                var bestF: Int; var best: SplitResult
-            }
-
-            // Root: histogram + candidate split.
-            do {
-                let cb = engine.queue.makeCommandBuffer()!
-                encodeBuildFind(cb, slot: 0, segStart: 0, count: rootCount, resultRow: 0)
-                cb.commit()
-                cb.waitUntilCompleted()
-            }
-            var rootG: Float = 0, rootH: Float = 0, rootC: Float = 0
-            do {
-                let h0 = histSlice(0, 0)
-                for b in 0..<nBins {
-                    rootG += h0[b * histChannels]
-                    rootH += h0[b * histChannels + 1]
-                    rootC += h0[b * histChannels + 2]
-                }
-            }
-            tCover[0] = rootC
-            tLeaf[0] = lr * min(max(-rootG / (rootH + lambda), negBound), posBound)
-            let rootBest = readBest(resultRow: 0)
-            var open = [OpenLeaf(node: 0, slot: 0, segStart: 0, count: rootCount,
-                                 G: rootG, H: rootH, depth: 0,
-                                 bestF: rootBest.f, best: rootBest.r)]
-            var nextSlot = 1
-            var leaves = 1
-
-            while leaves < numLeaves {
-                var bi = -1
-                var bg = params.minSplitGain
-                for (i, l) in open.enumerated()
-                    where l.bestF >= 0 && l.best.gain.isFinite && l.best.gain > bg {
-                    bg = l.best.gain; bi = i
-                }
-                if bi < 0 { break }
-                let L = open[bi]
-                let bestF = L.bestF
-                let best = L.best
-                let h = histSlice(L.slot, bestF)
-
-                // Replicate decide_splits' apply on the host.
-                var leftCount: Float = 0
-                var mask8 = [UInt32](repeating: 0, count: 8)
-                let isCat = UInt32(best.flags) & flagCategorical != 0
-                if isCat {
-                    let order = catSortHost(h)
-                    for i2 in 0..<Int(best.bin) {
-                        let b = order[i2]
-                        mask8[b >> 5] |= (1 << UInt32(b & 31))
-                        leftCount += h[b * histChannels + 2]
-                    }
+            if samplingActive {
+                e.zero(gossCursorBuf, length: 4)
+                e.zero(maxWGHBuf, length: 8)
+                if gossActive {
+                    e.zero(gossBucketsBuf, length: 1024 * 4)
+                    e.dispatch("goss_grad_hist",
+                               buffers: [ghBuf, maxGHBuf, gossBucketsBuf],
+                               params: UInt32(rows), grid: rowGrid, threadgroup: tg1D)
+                    e.dispatch("goss_threshold",
+                               buffers: [gossBucketsBuf, maxGHBuf, gossThresholdBuf],
+                               params: UInt32(Float(rows) * params.gossTopRate),
+                               grid: MTLSize(width: 1, height: 1, depth: 1),
+                               threadgroup: MTLSize(width: 1, height: 1, depth: 1))
                 } else {
-                    for b in 0...Int(best.bin) { leftCount += h[b * histChannels + 2] }
-                    if UInt32(best.flags) & flagDefaultLeft != 0 {
-                        leftCount += h[(nBins - 1) * histChannels + 2]
-                    }
-                    tThreshold[L.node] = edges[bestF * (dataBins - 1) + Int(best.bin)]
+                    e.dispatch("goss_threshold",
+                               buffers: [gossBucketsBuf, maxGHBuf, gossThresholdBuf],
+                               params: UInt32(0),
+                               grid: MTLSize(width: 1, height: 1, depth: 1),
+                               threadgroup: MTLSize(width: 1, height: 1, depth: 1))
                 }
-                tFeature[L.node] = Int32(bestF)
-                tBin[L.node] = best.bin
-                tFlags[L.node] = UInt8(best.flags)
-                tGain[L.node] = best.gain
-                if hasCats { for w in 0..<8 { tMask[L.node * 8 + w] = mask8[w] } }
-
-                let lcNode = 2 * L.node + 1, rcNode = 2 * L.node + 2
-                let lG = best.gl, lH = best.hl
-                let rG = L.G - lG, rH = L.H - lH
-                let rightCount = L.count - Int(leftCount)
-                var lb = nodeBounds[L.node], rb = nodeBounds[L.node]
-                let cst = isCat ? 0 : monotone[bestF]
-                if cst != 0 {
-                    let vl = -lG / (lH + lambda)
-                    let vr = -rG / (rH + lambda)
-                    let mid = min(max(0.5 * (vl + vr), nodeBounds[L.node].x),
-                                  nodeBounds[L.node].y)
-                    if cst > 0 { lb.y = min(lb.y, mid); rb.x = max(rb.x, mid) }
-                    else       { lb.x = max(lb.x, mid); rb.y = min(rb.y, mid) }
-                }
-                nodeBounds[lcNode] = lb
-                nodeBounds[rcNode] = rb
-                tCover[lcNode] = leftCount
-                tCover[rcNode] = Float(rightCount)
-                tLeaf[lcNode] = lr * min(max(-lG / (lH + lambda), lb.x), lb.y)
-                tLeaf[rcNode] = lr * min(max(-rG / (rH + lambda), rb.x), rb.y)
-
-                let childDepth = L.depth + 1
-                var leftLeaf = OpenLeaf(node: lcNode, slot: -1, segStart: L.segStart,
-                                        count: Int(leftCount), G: lG, H: lH,
-                                        depth: childDepth, bestF: -1,
-                                        best: SplitResult(gain: -.infinity, bin: 0,
-                                                          gl: 0, hl: 0, flags: 0))
-                var rightLeaf = leftLeaf
-                rightLeaf.node = rcNode
-                rightLeaf.segStart = L.segStart + Int(leftCount)
-                rightLeaf.count = rightCount
-                rightLeaf.G = rG; rightLeaf.H = rH
-
-                // Children at the depth cap can never split: no partition or
-                // histogram work needed, they are final leaves.
-                if childDepth < maxDepth && leaves + 1 < numLeaves {
-                    for w in 0..<8 { maskWords[w] = mask8[w] }
-                    let cb = engine.queue.makeCommandBuffer()!
-                    let groups = (L.count + samplesPerGroup - 1) / samplesPerGroup
-                    let partParams = PartitionParams(
-                        segStart: UInt32(L.segStart), segCount: UInt32(L.count),
-                        numSamples: UInt32(rows), numBins: UInt32(nBins),
-                        samplesPerGroup: UInt32(samplesPerGroup),
-                        feature: UInt32(bestF), bin: best.bin,
-                        flags: UInt32(best.flags))
-                    engine.dispatch(cb, "partition_count",
-                                    buffers: [binsBuf, orderABuf, leafMaskBuf, groupLeftBuf],
-                                    params: partParams,
-                                    grid: MTLSize(width: groups, height: 1, depth: 1),
-                                    threadgroup: tg1D, threadgroupGrid: true)
-                    engine.dispatch(cb, "partition_scan",
-                                    buffers: [groupLeftBuf, partTotalsBuf],
-                                    params: UInt32(groups),
-                                    grid: MTLSize(width: 1, height: 1, depth: 1),
-                                    threadgroup: MTLSize(width: 1, height: 1, depth: 1))
-                    engine.dispatch(cb, "partition_scatter",
-                                    buffers: [binsBuf, orderABuf, leafMaskBuf,
-                                              groupLeftBuf, partTotalsBuf, orderBBuf],
-                                    params: partParams,
-                                    grid: MTLSize(width: groups, height: 1, depth: 1),
-                                    threadgroup: tg1D, threadgroupGrid: true)
-                    engine.copyBuffer(cb, from: orderBBuf, srcOffset: L.segStart * 4,
-                                      to: orderABuf, dstOffset: L.segStart * 4,
-                                      length: L.count * 4)
-
-                    // Smaller child builds into a fresh slot (ties left, like
-                    // decide_splits); the sibling is derived IN the parent's
-                    // slot so the pool never exceeds numLeaves + 1 slots.
-                    let leftBuilds = Int(leftCount) <= rightCount
-                    let small = leftBuilds ? leftLeaf : rightLeaf
-                    let newSlot = nextSlot
-                    nextSlot += 1
-                    encodeBuildFind(cb, slot: newSlot, segStart: small.segStart,
-                                    count: small.count, resultRow: 0)
-                    engine.dispatch(cb, "subtract_slot",
-                                    buffers: [histPoolBuf, histPoolBuf],
-                                    params: UInt32(sliceLen),
-                                    grid: MTLSize(width: sliceLen, height: 1, depth: 1),
-                                    threadgroup: tg1D,
-                                    offsets: [L.slot * sliceLen * 4, newSlot * sliceLen * 4])
-                    encodeFind(cb, slot: L.slot, resultRow: 1)
-                    cb.commit()
-                    cb.waitUntilCompleted()
-
-                    let smallBest = readBest(resultRow: 0)
-                    let bigBest = readBest(resultRow: 1)
-                    if leftBuilds {
-                        leftLeaf.slot = newSlot
-                        leftLeaf.bestF = smallBest.f; leftLeaf.best = smallBest.r
-                        rightLeaf.slot = L.slot
-                        rightLeaf.bestF = bigBest.f; rightLeaf.best = bigBest.r
-                    } else {
-                        rightLeaf.slot = newSlot
-                        rightLeaf.bestF = smallBest.f; rightLeaf.best = smallBest.r
-                        leftLeaf.slot = L.slot
-                        leftLeaf.bestF = bigBest.f; leftLeaf.best = bigBest.r
-                    }
-                }
-                open.remove(at: bi)
-                open.append(leftLeaf)
-                open.append(rightLeaf)
-                leaves += 1
+                let otherProb = gossActive
+                    ? params.gossOtherRate / (1 - params.gossTopRate)
+                    : params.subsample
+                e.dispatch("goss_select",
+                           buffers: [ghBuf, gossThresholdBuf, orderBBuf,
+                                     gossCursorBuf, maxWGHBuf],
+                           params: GossParams(numSamples: UInt32(rows),
+                                              treeSeed: UInt32(t / K &+ 1),
+                                              otherProb: otherProb,
+                                              weight: gossActive ? gossWeight : 1),
+                           grid: rowGrid, threadgroup: tg1D)
+            }
+            e.dispatch("quantize_gradients",
+                       buffers: [ghBuf, activeMax, ghqBuf],
+                       params: QuantParams(numSamples: UInt32(rows)),
+                       grid: rowGrid, threadgroup: tg1D)
+            if !samplingActive {
+                e.dispatch("iota", buffers: [orderABuf], params: UInt32(rows),
+                           grid: rowGrid, threadgroup: tg1D)
+            }
+            e.end()
+            if samplingActive {
+                engine.copyBuffer(cb, from: orderBBuf, srcOffset: 0,
+                                  to: orderABuf, dstOffset: 0, length: rows * 4)
+                engine.copyBuffer(cb, from: gossCursorBuf, srcOffset: 0,
+                                  to: leafSegCountBuf, dstOffset: 0, length: 4)
             }
 
-            // Upload the finished tree for the GPU prediction/renewal
-            // kernels, apply it to train (and valid) predictions.
-            let nsPtr = nodeSplitsBufs[0].contents()
-                .bindMemory(to: NodeSplit.self, capacity: totalNodes)
-            let lvPtr = leafValuesBufs[0].contents()
-                .bindMemory(to: Float.self, capacity: totalNodes)
-            for n in 0..<totalNodes {
-                nsPtr[n] = NodeSplit(feature: tFeature[n], bin: tBin[n],
-                                     flags: UInt32(tFlags[n]))
-                lvPtr[n] = tLeaf[n]
+            e = engine.beginCompute(cb)
+            e.dispatch("leaf_reset",
+                       buffers: [nodeSplitsBuf, leafValuesBuf, catMaskBuf,
+                                 gainsBuf, coverBuf, lwStateBuf, lwSpecBuf],
+                       params: UInt32(totalNodes),
+                       grid: MTLSize(width: totalNodes, height: 1, depth: 1),
+                       threadgroup: tg1D)
+            if rows > lwSpg {
+                e.zero(histPoolBuf, length: sliceLen * 4)      // root slot 0
             }
-            if hasCats {
-                catMaskBufs[0].contents().copyMemory(
-                    from: tMask, byteCount: totalNodes * 8 * 4)
+            e.dispatch("build_histograms",
+                       buffers: [binsBuf, ghqBuf, orderABuf,
+                                 leafSegStartBuf, leafSegCountBuf,
+                                 histPoolBuf, activeMax, nodeSlotIdentBuf],
+                       params: HistParams(numSamples: UInt32(rows),
+                                          numFeatures: UInt32(cols),
+                                          numBins: UInt32(nBins), numNodes: 1,
+                                          samplesPerGroup: UInt32(lwSpg)),
+                       grid: MTLSize(width: maxSegGroups, height: numTiles, depth: 1),
+                       threadgroup: tg1D, threadgroupGrid: true)
+            e.dispatch("find_splits",
+                       buffers: [histPoolBuf, featFlagsBuf, featMaskBuf,
+                                 monotoneBuf, splitResBuf, statsBuf, nodeSlotIdentBuf],
+                       params: SplitParams(numFeatures: UInt32(cols),
+                                           numBins: UInt32(nBins), numNodes: 1,
+                                           lambda: lambda,
+                                           minChildHess: params.minChildHess,
+                                           minSplitGain: params.minSplitGain,
+                                           catSmooth: params.catSmooth,
+                                           levelStart: 0),
+                       grid: MTLSize(width: cols, height: 1, depth: 1),
+                       threadgroup: tg1D)
+            e.dispatch("leaf_init",
+                       buffers: [splitResBuf, histPoolBuf, lwOpenBuf, lwStateBuf,
+                                 leafValuesBuf, coverBuf, boundsBuf, leafSegCountBuf],
+                       params: lwParams,
+                       grid: MTLSize(width: 1, height: 1, depth: 1),
+                       threadgroup: MTLSize(width: 1, height: 1, depth: 1))
+
+            e.end()
+            let fusedStep = rows <= 262_144      // every segment fits one group
+            for _ in 1..<numLeaves {
+                if fusedStep {
+                    engine.dispatch(cb, "leaf_step",
+                               buffers: [lwOpenBuf, lwStateBuf, histPoolBuf,
+                                         nodeSplitsBuf, leafValuesBuf, catMaskBuf,
+                                         gainsBuf, coverBuf, boundsBuf, monotoneBuf,
+                                         leafMaskBuf, lwSpecBuf, lwSlotMapBuf, lwSegIOBuf,
+                                         splitResBuf, binsBuf, orderABuf, orderBBuf,
+                                         statsBuf, lwArgsBuild, lwArgsSub, lwArgsFind],
+                               params: lwParams,
+                               grid: MTLSize(width: 1, height: 1, depth: 1),
+                               threadgroup: tg1D, threadgroupGrid: true)
+                    engine.dispatchIndirect(cb, "build_histograms",
+                               buffers: [binsBuf, ghqBuf, orderABuf,
+                                         lwSegIOBuf, lwSegIOBuf,
+                                         histPoolBuf, activeMax, lwSlotMapBuf],
+                               params: HistParams(numSamples: UInt32(rows),
+                                                  numFeatures: UInt32(cols),
+                                                  numBins: UInt32(nBins), numNodes: 1,
+                                                  samplesPerGroup: UInt32(lwSpg)),
+                               indirect: lwArgsBuild, threadgroup: tg1D,
+                               offsets: [0, 0, 0, 0, 4, 0, 0, 0])
+                    engine.dispatchIndirect(cb, "subtract_slot",
+                               buffers: [histPoolBuf, lwSpecBuf],
+                               params: lwParams,
+                               indirect: lwArgsSub, threadgroup: tg1D)
+                    engine.dispatchIndirect(cb, "find_splits",
+                               buffers: [histPoolBuf, featFlagsBuf, featMaskBuf,
+                                         monotoneBuf, splitResBuf, statsBuf, lwSlotMapBuf],
+                               params: SplitParams(numFeatures: UInt32(cols),
+                                                   numBins: UInt32(nBins), numNodes: 2,
+                                                   lambda: lambda,
+                                                   minChildHess: params.minChildHess,
+                                                   minSplitGain: params.minSplitGain,
+                                                   catSmooth: params.catSmooth,
+                                                   levelStart: 1),
+                               indirect: lwArgsFind, threadgroup: tg1D)
+                    continue
+                }
+                engine.dispatch(cb, "leaf_pick_apply",
+                           buffers: [lwOpenBuf, lwStateBuf, histPoolBuf,
+                                     nodeSplitsBuf, leafValuesBuf, catMaskBuf,
+                                     gainsBuf, coverBuf, boundsBuf, monotoneBuf,
+                                     leafMaskBuf, lwSpecBuf, lwSlotMapBuf, lwSegIOBuf,
+                                     splitResBuf],
+                           params: lwParams,
+                           grid: MTLSize(width: 1, height: 1, depth: 1),
+                           threadgroup: MTLSize(width: 1, height: 1, depth: 1))
+                engine.dispatch(cb, "partition_count",
+                           buffers: [binsBuf, orderABuf, leafMaskBuf, groupLeftBuf,
+                                     lwSpecBuf],
+                           params: lwParams,
+                           grid: MTLSize(width: maxSegGroups, height: 1, depth: 1),
+                           threadgroup: tg1D, threadgroupGrid: true)
+                engine.dispatch(cb, "partition_scan",
+                           buffers: [groupLeftBuf, partTotalsBuf, lwSpecBuf],
+                           params: lwParams,
+                           grid: MTLSize(width: 1, height: 1, depth: 1),
+                           threadgroup: MTLSize(width: 1, height: 1, depth: 1))
+                engine.dispatch(cb, "partition_scatter",
+                           buffers: [binsBuf, orderABuf, leafMaskBuf, groupLeftBuf,
+                                     partTotalsBuf, orderBBuf, lwSpecBuf],
+                           params: lwParams,
+                           grid: MTLSize(width: maxSegGroups, height: 1, depth: 1),
+                           threadgroup: tg1D, threadgroupGrid: true)
+                engine.dispatch(cb, "copy_region",
+                           buffers: [orderBBuf, orderABuf, lwSpecBuf],
+                           params: UInt32(0),
+                           grid: rowGrid, threadgroup: tg1D)
+                if rows > lwSpg {
+                    engine.dispatch(cb, "zero_slot",
+                               buffers: [histPoolBuf, lwSpecBuf],
+                               params: lwParams,
+                               grid: MTLSize(width: sliceLen, height: 1, depth: 1),
+                               threadgroup: tg1D)
+                }
+                engine.dispatch(cb, "build_histograms",
+                           buffers: [binsBuf, ghqBuf, orderABuf,
+                                     lwSegIOBuf, lwSegIOBuf,
+                                     histPoolBuf, activeMax, lwSlotMapBuf],
+                           params: HistParams(numSamples: UInt32(rows),
+                                              numFeatures: UInt32(cols),
+                                              numBins: UInt32(nBins), numNodes: 1,
+                                              samplesPerGroup: UInt32(lwSpg)),
+                           grid: MTLSize(width: maxSegGroups, height: numTiles, depth: 1),
+                           threadgroup: tg1D, threadgroupGrid: true,
+                           offsets: [0, 0, 0, 0, 4, 0, 0, 0])
+                engine.dispatch(cb, "subtract_slot",
+                           buffers: [histPoolBuf, lwSpecBuf],
+                           params: lwParams,
+                           grid: MTLSize(width: sliceLen, height: 1, depth: 1),
+                           threadgroup: tg1D)
+                engine.dispatch(cb, "find_splits",
+                           buffers: [histPoolBuf, featFlagsBuf, featMaskBuf,
+                                     monotoneBuf, splitResBuf, statsBuf, lwSlotMapBuf],
+                           params: SplitParams(numFeatures: UInt32(cols),
+                                               numBins: UInt32(nBins), numNodes: 2,
+                                               lambda: lambda,
+                                               minChildHess: params.minChildHess,
+                                               minSplitGain: params.minSplitGain,
+                                               catSmooth: params.catSmooth,
+                                               levelStart: 0),
+                           grid: MTLSize(width: cols, height: 2, depth: 1),
+                           threadgroup: tg1D)
+            }
+
+            e = engine.beginCompute(cb)
+            e.dispatch("predict_tree_binned",
+                       buffers: [binsBuf, predsBuf, nodeSplitsBuf,
+                                 leafValuesBuf, catMaskBuf],
+                       params: PredictParams(numSamples: UInt32(rows),
+                                             maxDepth: UInt32(maxDepth),
+                                             numBins: UInt32(nBins),
+                                             predOffset: UInt32(classIdx * rows)),
+                       grid: rowGrid, threadgroup: tg1D)
+            if let v = valid, let vb = validBinsBuf, let vp = validPredsBuf {
+                e.dispatch("predict_tree_binned",
+                           buffers: [vb, vp, nodeSplitsBuf, leafValuesBuf, catMaskBuf],
+                           params: PredictParams(numSamples: UInt32(v.rows),
+                                                 maxDepth: UInt32(maxDepth),
+                                                 numBins: UInt32(nBins),
+                                                 predOffset: UInt32(classIdx * v.rows)),
+                           grid: MTLSize(width: v.rows, height: 1, depth: 1),
+                           threadgroup: tg1D)
             }
             if leafRenewal {
-                let bPtr = boundsBuf.contents()
-                    .bindMemory(to: SIMD2<Float>.self, capacity: totalNodes)
-                for n in 0..<totalNodes { bPtr[n] = nodeBounds[n] }
+                e.dispatch("assign_leaves",
+                           buffers: [binsBuf, nodeSplitsBuf, catMaskBuf, leafIdxBuf],
+                           params: PredictParams(numSamples: UInt32(rows),
+                                                 maxDepth: UInt32(maxDepth),
+                                                 numBins: UInt32(nBins),
+                                                 predOffset: 0),
+                           grid: rowGrid, threadgroup: tg1D)
             }
-            do {
-                let cb = engine.queue.makeCommandBuffer()!
-                engine.dispatch(cb, "predict_tree_binned",
-                                buffers: [binsBuf, predsBuf, nodeSplitsBufs[0],
-                                          leafValuesBufs[0], catMaskBufs[0]],
-                                params: PredictParams(numSamples: UInt32(rows),
-                                                      maxDepth: UInt32(maxDepth),
-                                                      numBins: UInt32(nBins),
-                                                      predOffset: UInt32(classIdx * rows)),
-                                grid: rowGrid, threadgroup: tg1D)
-                if let v = valid, let vb = validBinsBuf, let vp = validPredsBuf {
-                    engine.dispatch(cb, "predict_tree_binned",
-                                    buffers: [vb, vp, nodeSplitsBufs[0],
-                                              leafValuesBufs[0], catMaskBufs[0]],
-                                    params: PredictParams(numSamples: UInt32(v.rows),
-                                                          maxDepth: UInt32(maxDepth),
-                                                          numBins: UInt32(nBins),
-                                                          predOffset: UInt32(classIdx * v.rows)),
-                                    grid: MTLSize(width: v.rows, height: 1, depth: 1),
-                                    threadgroup: tg1D)
-                }
-                if leafRenewal {
-                    engine.dispatch(cb, "assign_leaves",
-                                    buffers: [binsBuf, nodeSplitsBufs[0], catMaskBufs[0],
-                                              leafIdxBuf],
-                                    params: PredictParams(numSamples: UInt32(rows),
-                                                          maxDepth: UInt32(maxDepth),
-                                                          numBins: UInt32(nBins),
-                                                          predOffset: 0),
-                                    grid: rowGrid, threadgroup: tg1D)
-                }
-                cb.commit()
+            e.end()
+            cb.commit()
+
+            if leafRenewal {
                 cb.waitUntilCompleted()
-            }
-            if leafRenewal {
-                // Same residual-quantile renewal as level-wise, host-side.
+                let lvPtr = leafValuesBuf.contents()
+                    .bindMemory(to: Float.self, capacity: totalNodes)
                 let leafIdxPtr = leafIdxBuf.contents().bindMemory(to: Int32.self, capacity: rows)
                 let step = max(1, rows / 262_144)
                 var buckets = [Int: [Float]]()
@@ -1292,36 +1184,36 @@ public final class MacBooster {
                     buckets[Int(leafIdxPtr[i]), default: []].append(labels[i] - predsPtr[i])
                     i += step
                 }
-                // The first predict pass applied the structural leaf
-                // values; renewal re-runs prediction with per-leaf DELTAS.
-                var deltas: [Int: Float] = [:]
+                let deltaPtr = lwDeltaBuf.contents()
+                    .bindMemory(to: Float.self, capacity: totalNodes)
+                for n in 0..<totalNodes { deltaPtr[n] = 0 }
+                var renewed = false
                 for (leaf, res) in buckets where res.count >= 4 {
                     var r = res
                     r.sort()
                     let q = r[min(r.count - 1, Int(Float(r.count) * renewalQ))]
-                    let bb = nodeBounds[leaf]
+                    let bb = boundsPtr[leaf]
                     let renewedValue = lr * min(max(q, bb.x), bb.y)
-                    if renewedValue != tLeaf[leaf] {
-                        deltas[leaf] = renewedValue - tLeaf[leaf]
-                        tLeaf[leaf] = renewedValue
+                    if renewedValue != lvPtr[leaf] {
+                        deltaPtr[leaf] = renewedValue - lvPtr[leaf]
+                        lvPtr[leaf] = renewedValue
+                        renewed = true
                     }
                 }
-                if !deltas.isEmpty {
-                    for n in 0..<totalNodes { lvPtr[n] = 0 }
-                    for (leaf, d) in deltas { lvPtr[leaf] = d }
-                    let cb = engine.queue.makeCommandBuffer()!
-                    engine.dispatch(cb, "predict_tree_binned",
-                                    buffers: [binsBuf, predsBuf, nodeSplitsBufs[0],
-                                              leafValuesBufs[0], catMaskBufs[0]],
+                if renewed {
+                    let cb2 = engine.queue.makeCommandBuffer()!
+                    engine.dispatch(cb2, "predict_tree_binned",
+                                    buffers: [binsBuf, predsBuf, nodeSplitsBuf,
+                                              lwDeltaBuf, catMaskBuf],
                                     params: PredictParams(numSamples: UInt32(rows),
                                                           maxDepth: UInt32(maxDepth),
                                                           numBins: UInt32(nBins),
-                                                          predOffset: UInt32(classIdx * rows)),
+                                                          predOffset: 0),
                                     grid: rowGrid, threadgroup: tg1D)
                     if let v = valid, let vb = validBinsBuf, let vp = validPredsBuf {
-                        engine.dispatch(cb, "predict_tree_binned",
-                                        buffers: [vb, vp, nodeSplitsBufs[0],
-                                                  leafValuesBufs[0], catMaskBufs[0]],
+                        engine.dispatch(cb2, "predict_tree_binned",
+                                        buffers: [vb, vp, nodeSplitsBuf,
+                                                  lwDeltaBuf, catMaskBuf],
                                         params: PredictParams(numSamples: UInt32(v.rows),
                                                               maxDepth: UInt32(maxDepth),
                                                               numBins: UInt32(nBins),
@@ -1329,13 +1221,14 @@ public final class MacBooster {
                                         grid: MTLSize(width: v.rows, height: 1, depth: 1),
                                         threadgroup: tg1D)
                     }
-                    cb.commit()
-                    cb.waitUntilCompleted()
+                    cb2.commit()
+                    pending.append((t, cb2))
+                } else {
+                    pending.append((t, cb))
                 }
+            } else {
+                pending.append((t, cb))
             }
-            trees.append(Tree(feature: tFeature, threshold: tThreshold, leaf: tLeaf,
-                              flags: tFlags, catMask: hasCats ? tMask : [],
-                              gain: tGain, cover: tCover))
         }
 
         var roundCB: MTLCommandBuffer?
@@ -1514,7 +1407,8 @@ public final class MacBooster {
                 e.dispatchIndirect("build_histograms",
                                         buffers: [binsBuf, ghqBuf, orderBuf(d),
                                                   segStartL[d], buildCountL[d], histCurBuf,
-                                                  samplingActive ? maxWGHBuf : maxGHBuf],
+                                                  samplingActive ? maxWGHBuf : maxGHBuf,
+                                                  nodeSlotIdentBuf],
                                         params: HistParams(numSamples: UInt32(rows),
                                                            numFeatures: UInt32(cols),
                                                            numBins: UInt32(nBins),
@@ -1531,7 +1425,8 @@ public final class MacBooster {
                 }
                 e.dispatch("find_splits",
                                 buffers: [histCurBuf, featFlagsBuf, featMaskBuf,
-                                          monotoneBuf, splitResBuf, statsBuf],
+                                          monotoneBuf, splitResBuf, statsBuf,
+                                          nodeSlotIdentBuf],
                                 params: SplitParams(numFeatures: UInt32(cols),
                                                     numBins: UInt32(nBins),
                                                     numNodes: UInt32(numLevel),

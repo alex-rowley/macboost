@@ -37,6 +37,7 @@ final class MetalEngine {
         "goss_grad_hist", "goss_threshold", "goss_select", "goss_finalize",
         "shadow_bins", "zero_buffer", "zero_built",
         "partition_count", "partition_scan", "partition_scatter", "subtract_slot",
+        "copy_region", "zero_slot", "leaf_reset", "leaf_init", "leaf_pick_apply", "leaf_step",
     ]
 
     init() throws {
@@ -99,10 +100,11 @@ final class MetalEngine {
     /// same command buffer (MTLDispatchThreadgroupsIndirectArguments).
     func dispatchIndirect<P>(_ cb: MTLCommandBuffer, _ name: String,
                              buffers: [MTLBuffer], params: P,
-                             indirect: MTLBuffer, threadgroup: MTLSize) {
+                             indirect: MTLBuffer, threadgroup: MTLSize,
+                             offsets: [Int]? = nil) {
         let enc = cb.makeComputeCommandEncoder()!
         enc.setComputePipelineState(pipeline(name))
-        for (i, b) in buffers.enumerated() { enc.setBuffer(b, offset: 0, index: i) }
+        for (i, b) in buffers.enumerated() { enc.setBuffer(b, offset: offsets?[i] ?? 0, index: i) }
         var p = params
         enc.setBytes(&p, length: MemoryLayout<P>.stride, index: buffers.count)
         enc.dispatchThreadgroups(indirectBuffer: indirect, indirectBufferOffset: 0,
@@ -156,11 +158,21 @@ final class ComputeEncoding {
     }
 
     func dispatch<P>(_ name: String, buffers: [MTLBuffer], params: P,
-                     grid: MTLSize, threadgroup: MTLSize) {
+                     grid: MTLSize, threadgroup: MTLSize,
+                     threadgroupGrid: Bool = false, offsets: [Int]? = nil) {
         prepare(name, buffers)
+        if let offsets {
+            for (i, o) in offsets.enumerated() where o != 0 {
+                enc.setBufferOffset(o, index: i)
+            }
+        }
         var p = params
         enc.setBytes(&p, length: MemoryLayout<P>.stride, index: buffers.count)
-        enc.dispatchThreads(grid, threadsPerThreadgroup: threadgroup)
+        if threadgroupGrid {
+            enc.dispatchThreadgroups(grid, threadsPerThreadgroup: threadgroup)
+        } else {
+            enc.dispatchThreads(grid, threadsPerThreadgroup: threadgroup)
+        }
     }
 
     func dispatchIndirect<P>(_ name: String, buffers: [MTLBuffer], params: P,
