@@ -36,6 +36,7 @@ final class MetalEngine {
         "route_samples", "predict_tree_binned", "predict_forest", "gpu_treeshap", "copy_cover", "assign_leaves", "debug_bounds",
         "goss_grad_hist", "goss_threshold", "goss_select", "goss_finalize",
         "shadow_bins", "zero_buffer", "zero_built",
+        "partition_count", "partition_scan", "partition_scatter", "subtract_slot",
     ]
 
     init() throws {
@@ -80,10 +81,10 @@ final class MetalEngine {
     func dispatch<P>(_ cb: MTLCommandBuffer, _ name: String,
                      buffers: [MTLBuffer], params: P,
                      grid: MTLSize, threadgroup: MTLSize,
-                     threadgroupGrid: Bool = false) {
+                     threadgroupGrid: Bool = false, offsets: [Int]? = nil) {
         let enc = cb.makeComputeCommandEncoder()!
         enc.setComputePipelineState(pipeline(name))
-        for (i, b) in buffers.enumerated() { enc.setBuffer(b, offset: 0, index: i) }
+        for (i, b) in buffers.enumerated() { enc.setBuffer(b, offset: offsets?[i] ?? 0, index: i) }
         var p = params
         enc.setBytes(&p, length: MemoryLayout<P>.stride, index: buffers.count)
         if threadgroupGrid {
@@ -121,6 +122,14 @@ final class MetalEngine {
     func fillZero(_ cb: MTLCommandBuffer, _ buffer: MTLBuffer, length: Int) {
         let blit = cb.makeBlitCommandEncoder()!
         blit.fill(buffer: buffer, range: 0..<length, value: 0)
+        blit.endEncoding()
+    }
+
+    func copyBuffer(_ cb: MTLCommandBuffer, from src: MTLBuffer, srcOffset: Int,
+                    to dst: MTLBuffer, dstOffset: Int, length: Int) {
+        let blit = cb.makeBlitCommandEncoder()!
+        blit.copy(from: src, sourceOffset: srcOffset, to: dst,
+                  destinationOffset: dstOffset, size: length)
         blit.endEncoding()
     }
 }

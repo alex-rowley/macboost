@@ -33,6 +33,7 @@ private struct CConfig: Codable {
     var num_class: Int?
     var init_model: String?
     var allowed_features: [Int]?
+    var num_leaves: Int?
 }
 
 private func makeParams(_ cfg: CConfig) throws -> BoosterParams {
@@ -57,6 +58,7 @@ private func makeParams(_ cfg: CConfig) throws -> BoosterParams {
     if let v = cfg.monotone_constraints { p.monotoneConstraints = v }
     if let v = cfg.num_class { p.numClasses = v }
     if let v = cfg.allowed_features { p.allowedFeatures = Set(v) }
+    if let v = cfg.num_leaves, v > 0 { p.numLeaves = v }
     if let v = cfg.metric, let m = EvalMetric(rawValue: v) { p.metric = m }
     switch cfg.objective ?? "regression" {
     case "regression", "l2", "mse": p.objective = .regression

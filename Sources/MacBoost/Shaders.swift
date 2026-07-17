@@ -469,6 +469,131 @@ inline bool goes_left(uchar b, NodeSplit s, uint numBins,
     return b <= uchar(s.bin);
 }
 
+// --- Leaf-wise growth: single-segment stable partition -----------------
+// Splitting one leaf partitions ITS slice of the order buffer into
+// left|right. Three dispatches: per-group left counts, a serial exclusive
+// scan, then a chunked stable scatter into a scratch buffer (each thread
+// owns a contiguous chunk, so within-chunk order is preserved and chunk
+// bases come from a threadgroup scan).
+
+struct PartitionParams {
+    uint segStart; uint segCount; uint numSamples; uint numBins;
+    uint samplesPerGroup; uint feature; uint bin; uint flags;
+};
+
+inline bool part_left(uchar b, device const uint *mask, constant PartitionParams &p) {
+    if (p.flags & FLAG_CATEGORICAL)
+        return (mask[b / 32u] >> (b % 32u)) & 1u;
+    if (b == uchar(p.numBins - 1))
+        return (p.flags & FLAG_DEFAULT_LEFT) != 0;
+    return b <= uchar(p.bin);
+}
+
+kernel void partition_count(
+    device const uchar *bins      [[buffer(0)]],
+    device const uint  *order     [[buffer(1)]],
+    device const uint  *mask      [[buffer(2)]],   // 8 words (categorical)
+    device uint        *groupLeft [[buffer(3)]],
+    constant PartitionParams &p   [[buffer(4)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]])
+{
+    uint g = tg.x;
+    uint gStart = g * p.samplesPerGroup;
+    threadgroup atomic_uint tot;
+    if (tid == 0) atomic_store_explicit(&tot, 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (gStart < p.segCount) {
+        uint gEnd = min(gStart + p.samplesPerGroup, p.segCount);
+        uint cnt = 0;
+        for (uint sIdx = gStart + tid; sIdx < gEnd; sIdx += TG_SIZE) {
+            uint i = order[p.segStart + sIdx];
+            uchar b = bins[bin_index(p.feature, i, p.numSamples)];
+            if (part_left(b, mask, p)) ++cnt;
+        }
+        atomic_fetch_add_explicit(&tot, cnt, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) groupLeft[g] = atomic_load_explicit(&tot, memory_order_relaxed);
+}
+
+kernel void partition_scan(
+    device uint   *groupLeft [[buffer(0)]],   // in: counts, out: exclusive starts
+    device uint   *totals    [[buffer(1)]],   // [0] = total lefts
+    constant uint &numGroups [[buffer(2)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i != 0) return;
+    uint acc = 0;
+    for (uint g = 0; g < numGroups; ++g) {
+        uint c = groupLeft[g];
+        groupLeft[g] = acc;
+        acc += c;
+    }
+    totals[0] = acc;
+}
+
+kernel void partition_scatter(
+    device const uchar *bins      [[buffer(0)]],
+    device const uint  *order     [[buffer(1)]],
+    device const uint  *mask      [[buffer(2)]],
+    device const uint  *groupLeft [[buffer(3)]],   // exclusive starts
+    device const uint  *totals    [[buffer(4)]],
+    device uint        *outOrder  [[buffer(5)]],   // scratch, same index space
+    constant PartitionParams &p   [[buffer(6)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]])
+{
+    uint g = tg.x;
+    uint gStart = g * p.samplesPerGroup;
+    if (gStart >= p.segCount) return;
+    uint gEnd = min(gStart + p.samplesPerGroup, p.segCount);
+    uint n = gEnd - gStart;
+    uint per = (n + TG_SIZE - 1) / TG_SIZE;
+    uint cStart = gStart + min(tid * per, n);
+    uint cEnd = gStart + min((tid + 1) * per, n);
+
+    uint myLeft = 0;
+    for (uint sIdx = cStart; sIdx < cEnd; ++sIdx) {
+        uint i = order[p.segStart + sIdx];
+        uchar b = bins[bin_index(p.feature, i, p.numSamples)];
+        if (part_left(b, mask, p)) ++myLeft;
+    }
+    threadgroup uint lefts[TG_SIZE];
+    threadgroup uint lbase[TG_SIZE], rbase[TG_SIZE];
+    lefts[tid] = myLeft;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        uint la = 0, ra = 0;
+        for (uint t = 0; t < TG_SIZE; ++t) {
+            uint tn = min((t + 1) * per, n) - min(t * per, n);
+            lbase[t] = la; rbase[t] = ra;
+            la += lefts[t]; ra += tn - lefts[t];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint leftTotal = totals[0];
+    uint lpos = p.segStart + groupLeft[g] + lbase[tid];
+    uint rpos = p.segStart + leftTotal + (gStart - groupLeft[g]) + rbase[tid];
+    for (uint sIdx = cStart; sIdx < cEnd; ++sIdx) {
+        uint i = order[p.segStart + sIdx];
+        uchar b = bins[bin_index(p.feature, i, p.numSamples)];
+        if (part_left(b, mask, p)) outOrder[lpos++] = i;
+        else                       outOrder[rpos++] = i;
+    }
+}
+
+// sibling = parent - child, in place in the parent's histogram slot.
+kernel void subtract_slot(
+    device float       *parent [[buffer(0)]],
+    device const float *child  [[buffer(1)]],
+    constant uint      &len    [[buffer(2)]],
+    uint j [[thread_position_in_grid]])
+{
+    if (j < len) parent[j] -= child[j];
+}
+
 // GOSS (gradient-based one-side sampling), LightGBM-style: keep the
 // top-rate fraction of samples by |gradient| plus a uniform sample of the
 // rest, amplifying the latter's gradients by (1-a)/b. The threshold is the

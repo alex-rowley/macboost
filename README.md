@@ -25,6 +25,9 @@ classification on dense data:**
 - **Data**: missing values (learned default directions), native categorical
   features (optimal subset splits), sample weights, CSV/TSV/LibSVM input,
   binary dataset cache (`.mbds`) for instant re-training
+- **Growth**: level-wise (default) or LightGBM-style leaf-wise via
+  `num_leaves` — best-first splits, monotone/categorical/NaN aware,
+  same model format
 - **Sampling**: GOSS (LightGBM's algorithm incl. its warm-up), bagging
   (`subsample`), column sampling (`colsample_bytree`)
 - **Constraints & interpretability**: monotone constraints with hard
@@ -384,8 +387,8 @@ exactly what they exist for.
 Parity here means: everything a single-node tabular regression or
 classification workflow touches, on dense data. Deliberately **not**
 implemented: ranking objectives (LambdaRank), sparse matrix input (native
-categoricals cover the dominant one-hot use case), leaf-wise growth (trees
-grow depth-wise, like XGBoost's default), DART, and distributed training —
+categoricals cover the dominant one-hot use case), DART, and distributed
+training —
 a Mac Studio is a single very fast node by design. If one of these gaps
 matters to you, the corresponding upstream test suite is the acceptance
 bar for a contribution.

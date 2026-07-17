@@ -49,6 +49,7 @@ _ALIASES = {
     "min_gain_to_split": "min_split_gain",
     "min_sum_hessian_in_leaf": "min_child_weight",
     "max_bins": "max_bin",
+    "max_leaves": "num_leaves",
     "categorical_feature": "categorical_features",
     "top_rate": "goss_top_rate",
     "other_rate": "goss_other_rate",
@@ -62,7 +63,7 @@ _ALIASES = {
 }
 
 _PARAM_NAMES = (
-    "n_estimators", "max_depth", "learning_rate", "reg_lambda",
+    "n_estimators", "max_depth", "learning_rate", "num_leaves", "reg_lambda",
     "min_child_weight", "min_split_gain", "max_bin", "categorical_features",
     "cat_smooth", "early_stopping_rounds", "verbose",
     "goss", "goss_top_rate", "goss_other_rate",
@@ -109,6 +110,7 @@ class _BaseBooster:
     _objective = "regression"
 
     def __init__(self, n_estimators=100, max_depth=6, learning_rate=0.1,
+                 num_leaves=None,
                  reg_lambda=1.0, min_child_weight=1.0, min_split_gain=0.0,
                  max_bin=256, categorical_features=None, cat_smooth=10.0,
                  early_stopping_rounds=0, verbose=False,
@@ -122,6 +124,7 @@ class _BaseBooster:
                  allowed_features=None, **aliases):
         self.n_estimators = n_estimators
         self.max_depth = max_depth
+        self.num_leaves = num_leaves
         self.learning_rate = learning_rate
         self.reg_lambda = reg_lambda
         self.min_child_weight = min_child_weight
@@ -201,6 +204,8 @@ class _BaseBooster:
             cfg["categorical_features"] = list(self.categorical_features)
         if self.allowed_features is not None:
             cfg["allowed_features"] = [int(f) for f in self.allowed_features]
+        if self.num_leaves:
+            cfg["num_leaves"] = int(self.num_leaves)
         return cfg
 
     def select_features(self, X, y, sample_weight=None, rounds=None,

@@ -41,6 +41,9 @@ TRAIN OPTIONS:
   --init-model <path>      continue training from a saved model
   --trees <n>              number of boosting rounds                   [default: 100]
   --depth <n>              max tree depth                              [default: 6]
+  --leaves <n>             leaf-wise (best-first) growth with this many
+                           leaves per tree (LightGBM num_leaves); depth
+                           becomes the path cap
   --learning-rate <f>      shrinkage                                   [default: 0.1]
   --lambda <f>             L2 leaf regularisation                      [default: 1.0]
   --min-child-weight <f>   minimum child hessian sum                   [default: 1.0]
@@ -157,6 +160,10 @@ func runTrain(_ flags: [String: String]) {
     var params = BoosterParams()
     params.numTrees = Int(flags["trees"] ?? "100") ?? 100
     params.maxDepth = Int(flags["depth"] ?? "6") ?? 6
+    if let l = flags["leaves"].flatMap({ Int($0) }) {
+        params.numLeaves = l
+        if flags["depth"] == nil { params.maxDepth = 12 }   // cap, not shape
+    }
     params.learningRate = Float(flags["learning-rate"] ?? "0.1") ?? 0.1
     params.lambda = Float(flags["lambda"] ?? "1.0") ?? 1.0
     params.minChildHess = Float(flags["min-child-weight"] ?? "1.0") ?? 1.0

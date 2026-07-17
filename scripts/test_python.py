@@ -322,6 +322,32 @@ with _tf.TemporaryDirectory() as _tmp:
     gap = float(np.abs(pr_ours - pr_theirs).max())
     check(gap < 3e-4, f"onnx multiclass probabilities match (max gap {gap:.2e})")
 
+print("leaf-wise growth (num_leaves)")
+Xh = rng.random((15_000, 6), dtype=np.float32)
+yh = 2 * Xh[:, 1] + np.where(
+    Xh[:, 0] > 0.9,
+    10 * np.where((Xh[:, 1] > 0.5) != (Xh[:, 2] > 0.5), 1.0, -1.0)
+    * np.where(Xh[:, 2] > 0.5, 1.5, 1.0), 0).astype(np.float32)
+m_level = MacBoostRegressor(n_estimators=60, max_depth=4).fit(Xh, yh)
+m_leaf = MacBoostRegressor(n_estimators=60, max_depth=8, num_leaves=16).fit(Xh, yh)
+r_level = float(np.sqrt(np.mean((m_level.predict(Xh) - yh) ** 2)))
+r_leaf = float(np.sqrt(np.mean((m_leaf.predict(Xh) - yh) ** 2)))
+check(r_leaf < r_level,
+      f"equal leaf budget: leaf-wise {r_leaf:.3f} beats level-wise {r_level:.3f}")
+m_alias = MacBoostRegressor(max_leaves=31)
+check(m_alias.num_leaves == 31, "max_leaves alias maps to num_leaves")
+from sklearn.base import clone as _clone_lw
+check(_clone_lw(m_leaf).get_params()["num_leaves"] == 16,
+      "num_leaves round-trips through sklearn clone")
+try:
+    MacBoostRegressor(n_estimators=5, max_depth=4, num_leaves=17).fit(Xg, yg)
+    raise SystemExit("expected MacBoostError for numLeaves > 2^maxDepth")
+except MacBoostError as e:
+    check("numLeaves" in str(e), "numLeaves > 2^maxDepth rejected")
+lw_clf = MacBoostClassifier(n_estimators=40, max_depth=8, num_leaves=31).fit(Xb, yb)
+lw_acc = float(np.mean(lw_clf.predict(Xb) == yb))
+check(lw_acc > 0.79, f"leaf-wise classifier accuracy {lw_acc:.3f}")
+
 print("boruta feature selection (GPU-resident shadows)")
 Xsel = np.column_stack([X[:, :5], rng.random((len(X), 5), dtype=np.float32)])
 sel_est = MacBoostRegressor(n_estimators=60)
