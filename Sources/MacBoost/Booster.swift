@@ -567,10 +567,14 @@ public final class MacBooster {
         let numDeriveBuf = engine.makeBuffer(length: 16)
         let validPredsBuf = valid.map { engine.makeBuffer(length: $0.rows * K * 4) }
 
-        // Per-tree output buffers are K-buffered so trees pipeline: the CPU
-        // reads tree t's structure back while the GPU already runs tree t+1.
-        // With a valid set the metric forces a sync per tree, so depth 1.
-        let pipelineDepth = valid == nil ? 4 : 1
+        // Per-tree output buffers are cycled so trees pipeline: the CPU
+        // reads tree t's structure back while the GPU already runs later
+        // trees. Multiclass batches a whole K-tree round into one command
+        // buffer, so it needs K buffer sets per round in flight (2 rounds
+        // without a valid set, 1 with). Single-output keeps depth 4 (1
+        // with a valid set, which forces a per-tree metric sync).
+        let pipelineDepth = K > 1 ? (valid == nil ? 2 * K : K)
+                                  : (valid == nil ? 4 : 1)
         let nodeSplitsBufs = (0..<pipelineDepth).map { _ in
             engine.makeBuffer(length: totalNodes * MemoryLayout<NodeSplit>.stride)
         }
@@ -804,6 +808,8 @@ public final class MacBooster {
             }
         }
 
+        var roundCB: MTLCommandBuffer?
+        var roundTreeIds: [Int] = []
         for t in 0..<totalTrees {
             let classIdx = t % K
             let k = t % pipelineDepth
@@ -820,11 +826,23 @@ public final class MacBooster {
             // level sizes the CPU cannot know are handled by decide_splits
             // writing the next level's indirect dispatch arguments.
             t0 = Clock.now()
-            let cb = engine.queue.makeCommandBuffer()!
-            engine.fillZero(cb, maxGHBuf, length: 8)
-            engine.fillZero(cb, statsBuf, length: totalNodes * 16)
+            // Multiclass: all K trees of a round share one command buffer
+            // (commits are costly at small row counts). Consecutive
+            // dispatches share compute encoders too, broken only where an
+            // indirect dispatch needs its arguments written by an earlier
+            // encoder (init/goss -> level 0, decide(d) -> level d+1).
+            let cb: MTLCommandBuffer
+            if K > 1, let rc = roundCB {
+                cb = rc
+            } else {
+                cb = engine.queue.makeCommandBuffer()!
+                roundCB = cb
+            }
+            var e = engine.beginCompute(cb)
+            e.zero(maxGHBuf, length: 8)
+            e.zero(statsBuf, length: totalNodes * 16)
             if K > 1 {
-                engine.dispatch(cb, "compute_gradients_multiclass",
+                e.dispatch("compute_gradients_multiclass",
                                 buffers: [predsBuf, labelsBuf, weightsBuf, ghBuf, maxGHBuf],
                                 params: GradMCParams(numSamples: UInt32(rows),
                                                      numClasses: UInt32(K),
@@ -838,7 +856,7 @@ public final class MacBooster {
                 case .tweedie: aux = params.tweedieVariancePower
                 default: aux = 0
                 }
-                engine.dispatch(cb, "compute_gradients",
+                e.dispatch("compute_gradients",
                                 buffers: [predsBuf, labelsBuf, weightsBuf, ghBuf, maxGHBuf],
                                 params: GradParams(numSamples: UInt32(rows),
                                                    objective: params.objective.rawValue,
@@ -846,7 +864,7 @@ public final class MacBooster {
                                                    hasWeights: hasWeights),
                                 grid: rowGrid, threadgroup: tg1D)
             }
-            engine.dispatch(cb, "init_tree",
+            e.dispatch("init_tree",
                             buffers: [segStartL[0], buildCountL[0], activeTotalL[0],
                                       numDeriveBuf, histArgsL[0], routeArgsL[0], boundsBuf],
                             params: InitParams(rows: UInt32(rows),
@@ -874,14 +892,14 @@ public final class MacBooster {
                 }
             }
             if samplingActive {
-                engine.fillZero(cb, gossCursorBuf, length: 4)
-                engine.fillZero(cb, maxWGHBuf, length: 8)
+                e.zero(gossCursorBuf, length: 4)
+                e.zero(maxWGHBuf, length: 8)
                 if gossActive {
-                    engine.fillZero(cb, gossBucketsBuf, length: 1024 * 4)
-                    engine.dispatch(cb, "goss_grad_hist",
+                    e.zero(gossBucketsBuf, length: 1024 * 4)
+                    e.dispatch("goss_grad_hist",
                                     buffers: [ghBuf, maxGHBuf, gossBucketsBuf],
                                     params: UInt32(rows), grid: rowGrid, threadgroup: tg1D)
-                    engine.dispatch(cb, "goss_threshold",
+                    e.dispatch("goss_threshold",
                                     buffers: [gossBucketsBuf, maxGHBuf, gossThresholdBuf],
                                     params: UInt32(Float(rows) * params.gossTopRate),
                                     grid: MTLSize(width: 1, height: 1, depth: 1),
@@ -890,7 +908,7 @@ public final class MacBooster {
                     // Bagging: topCount=0 puts the threshold at max|g|, so
                     // (near-)everything goes through the hashed uniform
                     // keep-test at rate `subsample`, all with weight 1.
-                    engine.dispatch(cb, "goss_threshold",
+                    e.dispatch("goss_threshold",
                                     buffers: [gossBucketsBuf, maxGHBuf, gossThresholdBuf],
                                     params: UInt32(0),
                                     grid: MTLSize(width: 1, height: 1, depth: 1),
@@ -899,7 +917,7 @@ public final class MacBooster {
                 let otherProb = gossActive
                     ? params.gossOtherRate / (1 - params.gossTopRate)
                     : params.subsample
-                engine.dispatch(cb, "goss_select",
+                e.dispatch("goss_select",
                                 buffers: [ghBuf, gossThresholdBuf, orderBBuf,
                                           gossCursorBuf, maxWGHBuf],
                                 params: GossParams(numSamples: UInt32(rows),
@@ -907,7 +925,7 @@ public final class MacBooster {
                                                    otherProb: otherProb,
                                                    weight: gossActive ? gossWeight : 1),
                                 grid: rowGrid, threadgroup: tg1D)
-                engine.dispatch(cb, "goss_finalize",
+                e.dispatch("goss_finalize",
                                 buffers: [gossCursorBuf, buildCountL[0], activeTotalL[0],
                                           histArgsL[0], routeArgsL[0]],
                                 params: GossFinalizeParams(
@@ -916,13 +934,13 @@ public final class MacBooster {
                                 grid: MTLSize(width: 1, height: 1, depth: 1),
                                 threadgroup: MTLSize(width: 1, height: 1, depth: 1))
             }
-            engine.dispatch(cb, "quantize_gradients",
+            e.dispatch("quantize_gradients",
                             buffers: [ghBuf, samplingActive ? maxWGHBuf : maxGHBuf, ghqBuf],
                             params: QuantParams(numSamples: UInt32(rows)),
                             grid: rowGrid, threadgroup: tg1D)
 
             func encodeRoute(_ d: Int, terminal: Bool) {
-                engine.dispatchIndirect(cb, "route_samples",
+                e.dispatchIndirect("route_samples",
                                         buffers: [orderBuf(d),
                                                   terminal ? orderBuf(d) : orderBuf(d + 1),
                                                   segStartL[d],
@@ -942,12 +960,14 @@ public final class MacBooster {
             for d in 0..<maxDepth {
                 let levelStart = (1 << d) - 1
                 let numLevel = 1 << d
+                e.end()
+                e = engine.beginCompute(cb)
                 if d > 0 {
                     encodeRoute(d - 1, terminal: false)
                     swap(&histCurBuf, &histPrevBuf)
                 }
-                engine.fillZero(cb, histCurBuf, length: numLevel * cols * nBins * histChannels * 4)
-                engine.dispatchIndirect(cb, "build_histograms",
+                e.zero(histCurBuf, length: numLevel * cols * nBins * histChannels * 4)
+                e.dispatchIndirect("build_histograms",
                                         buffers: [binsBuf, ghqBuf, orderBuf(d),
                                                   segStartL[d], buildCountL[d], histCurBuf,
                                                   samplingActive ? maxWGHBuf : maxGHBuf],
@@ -959,13 +979,13 @@ public final class MacBooster {
                                         indirect: histArgsL[d], threadgroup: tg1D)
                 if d > 0 {
                     let sliceLen = cols * nBins * histChannels
-                    engine.dispatch(cb, "subtract_histograms",
+                    e.dispatch("subtract_histograms",
                                     buffers: [histPrevBuf, histCurBuf, deriveMapBuf, numDeriveBuf],
                                     params: SubParams(sliceLen: UInt32(sliceLen)),
                                     grid: MTLSize(width: sliceLen, height: numLevel / 2, depth: 1),
                                     threadgroup: tg1D)
                 }
-                engine.dispatch(cb, "find_splits",
+                e.dispatch("find_splits",
                                 buffers: [histCurBuf, featFlagsBuf, featMaskBuf,
                                           monotoneBuf, splitResBuf],
                                 params: SplitParams(numFeatures: UInt32(cols),
@@ -978,7 +998,7 @@ public final class MacBooster {
                                 grid: MTLSize(width: cols, height: numLevel, depth: 1),
                                 threadgroup: tg1D)
                 let nextLevel = min(d + 1, maxDepth - 1)
-                engine.dispatch(cb, "decide_splits",
+                e.dispatch("decide_splits",
                                 buffers: [splitResBuf, histCurBuf, nodeSplitsBuf, leafValuesBuf,
                                           catMaskBuf, statsBuf,
                                           segStartL[nextLevel], segCursorL[nextLevel],
@@ -1003,21 +1023,23 @@ public final class MacBooster {
 
             // Deepest level: mark leaves, then the terminal route applies
             // every remaining sample's leaf value to its prediction.
-            engine.dispatch(cb, "final_leaves",
+            e.end()
+            e = engine.beginCompute(cb)
+            e.dispatch("final_leaves",
                             buffers: [nodeSplitsBuf, leafValuesBuf, statsBuf, boundsBuf],
                             params: FinalParams(lastStart: UInt32((1 << maxDepth) - 1),
                                                 numLast: UInt32(1 << maxDepth),
                                                 lambda: lambda, learningRate: lr),
                             grid: MTLSize(width: 1 << maxDepth, height: 1, depth: 1),
                             threadgroup: tg1D)
-            engine.dispatch(cb, "copy_cover",
+            e.dispatch("copy_cover",
                             buffers: [statsBuf, coverBuf],
                             params: UInt32(totalNodes),
                             grid: MTLSize(width: totalNodes, height: 1, depth: 1),
                             threadgroup: tg1D)
             encodeRoute(maxDepth - 1, terminal: true)
             if leafRenewal {
-                engine.dispatch(cb, "assign_leaves",
+                e.dispatch("assign_leaves",
                                 buffers: [binsBuf, nodeSplitsBuf, catMaskBuf, leafIdxBuf],
                                 params: PredictParams(numSamples: UInt32(rows),
                                                       maxDepth: UInt32(maxDepth),
@@ -1028,7 +1050,7 @@ public final class MacBooster {
             if samplingActive && !leafRenewal {
                 // Sampling means routed leaf application only covered kept
                 // rows; walk the finished tree for EVERY row instead.
-                engine.dispatch(cb, "predict_tree_binned",
+                e.dispatch("predict_tree_binned",
                                 buffers: [binsBuf, predsBuf, nodeSplitsBuf,
                                           leafValuesBuf, catMaskBuf],
                                 params: PredictParams(numSamples: UInt32(rows),
@@ -1038,7 +1060,7 @@ public final class MacBooster {
                                 grid: rowGrid, threadgroup: tg1D)
             }
             if !leafRenewal, let v = valid, let vb = validBinsBuf, let vp = validPredsBuf {
-                engine.dispatch(cb, "predict_tree_binned",
+                e.dispatch("predict_tree_binned",
                                 buffers: [vb, vp, nodeSplitsBuf, leafValuesBuf, catMaskBuf],
                                 params: PredictParams(numSamples: UInt32(v.rows),
                                                       maxDepth: UInt32(maxDepth),
@@ -1047,7 +1069,12 @@ public final class MacBooster {
                                 grid: MTLSize(width: v.rows, height: 1, depth: 1),
                                 threadgroup: tg1D)
             }
-            cb.commit()
+            e.end()
+            let roundEnd = K == 1 || classIdx == K - 1 || t + 1 == totalTrees
+            if roundEnd {
+                cb.commit()
+                roundCB = nil
+            }
             if leafRenewal {
                 cb.waitUntilCompleted()
                 // Per-leaf residual quantiles from a stride subsample.
@@ -1090,8 +1117,14 @@ public final class MacBooster {
                 }
                 cb2.commit()
                 pending.append((t, cb2))
-            } else {
+            } else if K == 1 {
                 pending.append((t, cb))
+            } else {
+                roundTreeIds.append(t)
+                if roundEnd {
+                    for tt in roundTreeIds { pending.append((tt, cb)) }
+                    roundTreeIds.removeAll()
+                }
             }
             timings.gpuLevels += Clock.since(t0)
 

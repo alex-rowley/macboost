@@ -295,8 +295,16 @@ final class SelectionTests: XCTestCase {
         let pred = b.predict(featureMajor: X, rows: rows, cols: cols)
         let predRef = ref.predict(featureMajor: Array(X[0..<(5 * rows)]),
                                   rows: rows, cols: 5)
-        let mse = zip(pred, y).map { ($0 - $1) * ($0 - $1) }.reduce(0, +) / Float(rows)
-        let mseRef = zip(predRef, y).map { ($0 - $1) * ($0 - $1) }.reduce(0, +) / Float(rows)
+        var mse: Float = 0
+        var mseRef: Float = 0
+        for i in 0..<rows {
+            let d = pred[i] - y[i]
+            let dr = predRef[i] - y[i]
+            mse += d * d
+            mseRef += dr * dr
+        }
+        mse /= Float(rows)
+        mseRef /= Float(rows)
         XCTAssertLessThan(abs(mse - mseRef), 0.15,
             "masked model must match a model trained on the kept columns")
 

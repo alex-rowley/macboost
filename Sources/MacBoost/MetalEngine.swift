@@ -35,7 +35,7 @@ final class MetalEngine {
         "init_tree", "decide_splits", "final_leaves",
         "route_samples", "predict_tree_binned", "predict_forest", "gpu_treeshap", "copy_cover", "assign_leaves", "debug_bounds",
         "goss_grad_hist", "goss_threshold", "goss_select", "goss_finalize",
-        "shadow_bins",
+        "shadow_bins", "zero_buffer",
     ]
 
     init() throws {
@@ -109,9 +109,67 @@ final class MetalEngine {
         enc.endEncoding()
     }
 
+    /// Begin a shared compute encoder: consecutive dispatches reuse one
+    /// encoder with a memory barrier between them instead of paying an
+    /// encoder open/close per dispatch (which dominates small-data
+    /// training). Indirect dispatch arguments must be written in an
+    /// EARLIER encoder than the one consuming them — group accordingly.
+    func beginCompute(_ cb: MTLCommandBuffer) -> ComputeEncoding {
+        ComputeEncoding(engine: self, enc: cb.makeComputeCommandEncoder()!)
+    }
+
     func fillZero(_ cb: MTLCommandBuffer, _ buffer: MTLBuffer, length: Int) {
         let blit = cb.makeBlitCommandEncoder()!
         blit.fill(buffer: buffer, range: 0..<length, value: 0)
         blit.endEncoding()
     }
+}
+
+/// One live compute encoder shared across a dependent chain of dispatches.
+/// A buffer-scope memory barrier is inserted before every dispatch after
+/// the first, so sequential semantics match the one-encoder-per-dispatch
+/// encoding this replaces.
+final class ComputeEncoding {
+    private let engine: MetalEngine
+    let enc: MTLComputeCommandEncoder
+    private var first = true
+
+    init(engine: MetalEngine, enc: MTLComputeCommandEncoder) {
+        self.engine = engine
+        self.enc = enc
+    }
+
+    private func prepare(_ name: String, _ buffers: [MTLBuffer]) {
+        if !first { enc.memoryBarrier(scope: .buffers) }
+        first = false
+        enc.setComputePipelineState(engine.pipeline(name))
+        for (i, b) in buffers.enumerated() { enc.setBuffer(b, offset: 0, index: i) }
+    }
+
+    func dispatch<P>(_ name: String, buffers: [MTLBuffer], params: P,
+                     grid: MTLSize, threadgroup: MTLSize) {
+        prepare(name, buffers)
+        var p = params
+        enc.setBytes(&p, length: MemoryLayout<P>.stride, index: buffers.count)
+        enc.dispatchThreads(grid, threadsPerThreadgroup: threadgroup)
+    }
+
+    func dispatchIndirect<P>(_ name: String, buffers: [MTLBuffer], params: P,
+                             indirect: MTLBuffer, threadgroup: MTLSize) {
+        prepare(name, buffers)
+        var p = params
+        enc.setBytes(&p, length: MemoryLayout<P>.stride, index: buffers.count)
+        enc.dispatchThreadgroups(indirectBuffer: indirect, indirectBufferOffset: 0,
+                                 threadsPerThreadgroup: threadgroup)
+    }
+
+    /// Zero `length` bytes (must be a multiple of 4) via a compute kernel,
+    /// so zeroing joins the shared encoder instead of forcing a blit break.
+    func zero(_ buffer: MTLBuffer, length: Int) {
+        dispatch("zero_buffer", buffers: [buffer], params: UInt32(length / 4),
+                 grid: MTLSize(width: length / 4, height: 1, depth: 1),
+                 threadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+
+    func end() { enc.endEncoding() }
 }

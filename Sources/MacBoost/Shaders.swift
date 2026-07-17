@@ -917,6 +917,14 @@ kernel void predict_forest(
     }
 }
 
+kernel void zero_buffer(
+    device uint   *buf [[buffer(0)]],
+    constant uint &n   [[buffer(1)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i < n) buf[i] = 0;
+}
+
 struct ShadowParams { uint numSamples; uint numFeatures; uint halfBits; uint seed; };
 
 // Bijective pseudo-random permutation of [0, n): a 4-round Feistel network
