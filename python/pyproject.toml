@@ -1,6 +1,6 @@
 [project]
 name = "macboost"
-version = "0.7.0"
+version = "0.8.0"
 description = "Gradient boosted trees on Apple-silicon GPUs (Metal), sklearn-style API"
 readme = "README.md"
 requires-python = ">=3.10"
