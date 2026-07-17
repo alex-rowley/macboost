@@ -148,4 +148,24 @@ $CLI importance --model "$WORK/model.json" | head -3 | grep -q "feature" \
     || { echo "importance subcommand failed"; exit 1; }
 echo "importance OK"
 
+# Feature selection: add a pure-noise column; it must be rejected and the
+# trained model must keep the informative ones.
+python3 - "$WORK" << 'PYEOF2'
+import csv, random, sys
+work = sys.argv[1]
+random.seed(9)
+with open(f"{work}/train.csv") as src, open(f"{work}/sel.csv", "w", newline="") as dst:
+    r = csv.reader(src); w = csv.writer(dst)
+    header = next(r)
+    w.writerow(header[:-1] + ["junk", header[-1]])
+    for row in r:
+        w.writerow(row[:-1] + [f"{random.random():.6f}", row[-1]])
+PYEOF2
+$CLI train --data "$WORK/sel.csv" --label target --categorical cat \
+    --feature-selection --selection-rounds 10 --trees 60 --eval-every 100 \
+    --output "$WORK/sel.json" | tee "$WORK/sel.log" | grep -q "rejected: junk" \
+    || { echo "feature selection did not reject the junk column"; cat "$WORK/sel.log"; exit 1; }
+grep -q "keeping" "$WORK/sel.log" || { echo "selection summary missing"; exit 1; }
+echo "feature selection OK"
+
 echo "CLI smoke test PASSED"

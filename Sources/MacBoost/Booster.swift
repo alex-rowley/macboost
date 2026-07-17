@@ -50,6 +50,10 @@ public struct BoosterParams {
     public var metric: EvalMetric = .auto
     /// Number of classes for the multiclass objective (labels 0..<K).
     public var numClasses: Int = 1
+    /// When set, splits only consider these feature indices (the model
+    /// still accepts full-width X at predict time). Set automatically by
+    /// feature selection; composes with featureFraction sampling.
+    public var allowedFeatures: Set<Int>?
     public init() {}
 }
 
@@ -115,7 +119,7 @@ let flagDefaultLeft: UInt32 = 1
 let flagCategorical: UInt32 = 2
 
 // Param structs mirroring the MSL structs (all 4-byte fields, no padding).
-private struct BinParams { var numSamples: UInt32; var numFeatures: UInt32; var numBins: UInt32 }
+struct BinParams { var numSamples: UInt32; var numFeatures: UInt32; var numBins: UInt32 }
 private struct GradParams {
     var numSamples: UInt32; var objective: UInt32
     var alpha: Float; var aux: Float; var hasWeights: UInt32
@@ -199,7 +203,11 @@ public final class MacBooster {
 
     let engine: MetalEngine
 
-    public init(params: BoosterParams) throws {
+    public convenience init(params: BoosterParams) throws {
+        try self.init(params: params, engine: nil)
+    }
+
+    init(params: BoosterParams, engine: MetalEngine?) throws {
         guard params.numBins >= 4 && params.numBins <= 256 else {
             throw MacBoostError.invalidInput("numBins must be in 4...256, got \(params.numBins)")
         }
@@ -260,7 +268,7 @@ public final class MacBooster {
         self.params = params
         self.trainedNumBins = params.numBins
         self.trainedCategorical = params.categoricalFeatures
-        self.engine = try MetalEngine()
+        self.engine = try engine ?? MetalEngine()
     }
 
     public var deviceName: String { engine.device.name }
@@ -337,7 +345,17 @@ public final class MacBooster {
                              bins: bins, edges: edges)
     }
 
-    private func fitImpl(X: [Float]?, prebinned: BinnedDataset?, rows: Int, cols: Int,
+    /// GPU-resident pre-binned input (feature selection's shadow matrix):
+    /// tiled bin bytes that never exist host-side.
+    struct GPUBinned {
+        let bins: MTLBuffer          // tiled layout, `cols` features wide
+        let edges: [Float]
+        let categorical: Set<Int>
+        let numBins: Int
+    }
+
+    func fitImpl(X: [Float]?, prebinned: BinnedDataset?,
+                 gpuBinned: GPUBinned? = nil, rows: Int, cols: Int,
                          labels: [Float], weights: [Float]?, valid: EvalSet?,
                          earlyStoppingRounds: Int, evalEvery: Int,
                          initModel: MacBooster?,
@@ -378,6 +396,12 @@ public final class MacBooster {
             throw MacBoostError.invalidInput(
                 "monotoneConstraints has \(mc.count) entries, X has \(cols) features")
         }
+        if let af = params.allowedFeatures {
+            guard !af.isEmpty, af.allSatisfy({ $0 >= 0 && $0 < cols }) else {
+                throw MacBoostError.invalidInput(
+                    "allowedFeatures must be non-empty indices within 0..<\(cols)")
+            }
+        }
         if let im = initModel {
             guard X != nil else {
                 throw MacBoostError.invalidInput(
@@ -400,8 +424,9 @@ public final class MacBooster {
         let tTotal = Clock.now()
 
         // The dataset (when given) dictates binning and categorical layout.
-        let categorical = prebinned?.categorical ?? params.categoricalFeatures
-        let nBins = prebinned?.numBins ?? params.numBins
+        let categorical = gpuBinned?.categorical ?? prebinned?.categorical
+            ?? params.categoricalFeatures
+        let nBins = gpuBinned?.numBins ?? prebinned?.numBins ?? params.numBins
         trainedNumBins = nBins
         trainedCategorical = categorical
         let dataBins = nBins - 1
@@ -434,7 +459,10 @@ public final class MacBooster {
         let edges: [Float]
         let binsBuf: MTLBuffer
         let validBinsBuf = valid.map { engine.makeBuffer(length: $0.rows * numTiles * tileF) }
-        if let ds = prebinned {
+        if let gb = gpuBinned {
+            edges = gb.edges
+            binsBuf = gb.bins
+        } else if let ds = prebinned {
             edges = ds.edges
             binsBuf = engine.makeBuffer(ds.bins)
         } else {
@@ -445,7 +473,7 @@ public final class MacBooster {
         do {
             let cb = engine.queue.makeCommandBuffer()!
             var needsCommit = false
-            if prebinned == nil {
+            if prebinned == nil && gpuBinned == nil {
                 let edgesBuf = engine.makeBuffer(edges)
                 let xBuf = engine.makeBuffer(X!)
                 engine.dispatch(cb, "bin_data",
@@ -558,10 +586,15 @@ public final class MacBooster {
         let coverBufs = (0..<pipelineDepth).map { _ in
             engine.makeBuffer(length: totalNodes * 4)
         }
-        // Per-tree feature masks (colsample_bytree); all-ones when off.
+        // Per-tree feature masks (colsample_bytree and/or allowedFeatures);
+        // all-ones when both are off.
         let colsampling = params.featureFraction < 1
+        var maskBase = [UInt8](repeating: 1, count: cols)
+        if let af = params.allowedFeatures {
+            for f in 0..<cols { maskBase[f] = af.contains(f) ? 1 : 0 }
+        }
         let featMaskBufs = (0..<(colsampling ? pipelineDepth : 1)).map { _ in
-            engine.makeBuffer([UInt8](repeating: 1, count: cols))
+            engine.makeBuffer(maskBase)
         }
         let predsPtr = predsBuf.contents().bindMemory(to: Float.self, capacity: rows * K)
 
@@ -830,11 +863,15 @@ public final class MacBooster {
                 var rng = SplitMix64(seed: 0xC0150001 &+ UInt64(t) &* 0x9E3779B97F4A7C15)
                 var any = false
                 for f in 0..<cols {
-                    let keep: UInt8 = rng.uniform() < params.featureFraction ? 1 : 0
+                    let keep: UInt8 = maskBase[f] == 1
+                        && rng.uniform() < params.featureFraction ? 1 : 0
                     maskPtr[f] = keep
                     any = any || keep == 1
                 }
-                if !any { maskPtr[Int(rng.next() % UInt64(cols))] = 1 }
+                if !any {
+                    let candidates = (0..<cols).filter { maskBase[$0] == 1 }
+                    maskPtr[candidates[Int(rng.next() % UInt64(candidates.count))]] = 1
+                }
             }
             if samplingActive {
                 engine.fillZero(cb, gossCursorBuf, length: 4)
@@ -1132,7 +1169,7 @@ public final class MacBooster {
     /// tweedie require non-negative labels; multiclass requires class ids.
     /// Fast path: one vectorised scan, with a per-row pass only to localise
     /// an error.
-    private func validateLabels(_ labels: [Float]) throws {
+    func validateLabels(_ labels: [Float]) throws {
         let logistic = params.objective == .binaryLogistic
         let nonNegative = params.objective.usesLogLink
         let multiclass = params.objective == .multiclass
@@ -1218,7 +1255,7 @@ public final class MacBooster {
         }
     }
 
-    private func validateCategoricals(_ X: [Float], rows: Int, cols: Int) throws {
+    func validateCategoricals(_ X: [Float], rows: Int, cols: Int) throws {
         let dataBins = params.numBins - 1
         for f in params.categoricalFeatures {
             guard f >= 0 && f < cols else {

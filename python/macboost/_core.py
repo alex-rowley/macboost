@@ -62,6 +62,13 @@ def _configure(_lib):
         ctypes.c_char_p, _f32_p, ctypes.c_int64, ctypes.c_int64, _f32_p, _f32_p,
         _f32_p, ctypes.c_int64, _f32_p, _c_char_pp,
     ]
+    _lib.macboost_select_features.restype = ctypes.c_int32
+    _lib.macboost_select_features.argtypes = [
+        ctypes.c_char_p, _f32_p, ctypes.c_int64, ctypes.c_int64, _f32_p, _f32_p,
+        ctypes.c_int32, ctypes.c_float, ctypes.c_int64,
+        ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32), _f32_p,
+        _c_char_pp,
+    ]
     _lib.macboost_predict_contrib.restype = ctypes.c_int32
     _lib.macboost_predict_contrib.argtypes = [
         ctypes.c_void_p, _f32_p, ctypes.c_int64, ctypes.c_int64, _f32_p, _c_char_pp,
@@ -156,6 +163,36 @@ def train(config: dict, X, y, eval_set=None, sample_weight=None) -> _Handle:
     if not ptr:
         raise MacBoostError(_take_error(err))
     return _Handle(ptr)
+
+
+def select_features(config: dict, X, y, sample_weight=None,
+                    rounds: int = 20, alpha: float = 0.05,
+                    seed: int = 0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Boruta shadow selection in the native core. Returns (hits, decision,
+    gain_ratio) where decision is 2=confirmed, 1=tentative, 0=rejected."""
+    Xf, rows, cols = _feature_major(X)
+    ya = np.ascontiguousarray(np.asarray(y, dtype=np.float32).ravel())
+    if ya.shape[0] != rows:
+        raise ValueError(f"y has {ya.shape[0]} rows, X has {rows}")
+    w_ptr = None
+    if sample_weight is not None:
+        wa = np.ascontiguousarray(np.asarray(sample_weight, dtype=np.float32).ravel())
+        if wa.shape[0] != rows:
+            raise ValueError(f"sample_weight has {wa.shape[0]} rows, X has {rows}")
+        w_ptr = _f32(wa)
+    hits = np.empty(cols, dtype=np.int32)
+    decision = np.empty(cols, dtype=np.int32)
+    ratio = np.empty(cols, dtype=np.float32)
+    err = ctypes.c_char_p()
+    rc = _lib.macboost_select_features(
+        json.dumps(config).encode(), _f32(Xf), rows, cols, _f32(ya), w_ptr,
+        rounds, alpha, seed,
+        hits.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+        decision.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+        _f32(ratio), ctypes.byref(err))
+    if rc != 0:
+        raise MacBoostError(_take_error(err))
+    return hits, decision, ratio
 
 
 def predict(handle: _Handle, X) -> np.ndarray:

@@ -31,6 +31,8 @@ classification on dense data:**
   bounds-propagated guarantees, gain/split feature importance, GPU
   TreeSHAP contributions (incl. multiclass; ~50M row·trees/s — 200k rows
   × 100 trees explained in 0.4s), calibrated L1/quantile leaves
+- **Feature selection**: built-in Boruta (shadow features) — see below;
+  no other GBM library ships this natively
 - **Workflow**: early stopping with per-iteration GPU validation eval,
   metric overrides incl. AUC, warm starts (`init_model`), JSON model
   save/load, GPU batch inference (bit-identical to the CPU path)
@@ -257,6 +259,39 @@ model.save_onnx("model.onnx")
 
 The graph outputs what `predict` returns: probabilities for classifiers,
 means for poisson/tweedie, raw scores for regression.
+
+## Feature selection (Boruta, GPU-resident)
+
+Everyone benchmarks feature importance against random probes eventually;
+the principled version is **Boruta** (Kursa & Rudnicki 2010): train on
+`[X | shadow(X)]` where shadows are row-permuted copies of the real
+columns, score a feature a "hit" each round its gain beats the *best*
+shadow, repeat with fresh permutations, and let a binomial test sort
+features into confirmed / tentative / rejected. Nobody ships it natively
+because it retrains the model ~20 times — which costs minutes elsewhere
+and seconds here.
+
+```python
+model = MacBoostRegressor(feature_selection=True).fit(X, y)   # select, then train clean
+model.selected_features_          # surviving column indices
+model.selection_result_           # hits, verdicts, gain vs shadow ceiling
+
+sel = MacBoostRegressor().select_features(X, y, rounds=20)    # selection only
+sel.confirmed_, sel.tentative_, sel.rejected_
+```
+
+CLI: `macboost train --feature-selection [--selection-rounds 20] ...`
+
+Implementation is unique to this engine: shadows never exist as data.
+The training matrix is already binned in GPU memory, and a permuted
+column has identical bin edges to its original — so a kernel gathers
+each column's bin bytes through a per-column random bijection (a Feistel
+network, no sort, no index array) straight into a double-width binned
+matrix that lives only on the GPU for the duration. Each round re-seeds
+the permutation and retrains; your `X` is never copied, extended, or
+touched. The final model trains with rejected features masked out of the
+split search, so it still accepts full-width `X` at predict time — no
+column bookkeeping downstream.
 
 ## Guardrails
 

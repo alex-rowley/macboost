@@ -68,12 +68,41 @@ _PARAM_NAMES = (
     "goss", "goss_top_rate", "goss_other_rate",
     "objective", "alpha", "tweedie_variance_power", "scale_pos_weight",
     "subsample", "colsample_bytree", "monotone_constraints", "metric",
-    "importance_type",
+    "importance_type", "feature_selection", "selection_rounds",
+    "selection_alpha", "allowed_features",
 )
 
 
 def _canonical(name):
     return _ALIASES.get(name, name)
+
+
+class FeatureSelection:
+    """Result of Boruta shadow selection. decision: 2=confirmed,
+    1=tentative, 0=rejected per feature."""
+
+    def __init__(self, hits, decision, gain_ratio, rounds):
+        self.hits = hits
+        self.decision = decision
+        self.gain_ratio = gain_ratio
+        self.rounds = rounds
+
+    @property
+    def confirmed_(self):
+        return np.nonzero(self.decision == 2)[0]
+
+    @property
+    def tentative_(self):
+        return np.nonzero(self.decision == 1)[0]
+
+    @property
+    def rejected_(self):
+        return np.nonzero(self.decision == 0)[0]
+
+    def __repr__(self):
+        return (f"FeatureSelection(confirmed={[int(f) for f in self.confirmed_]}, "
+                f"tentative={[int(f) for f in self.tentative_]}, "
+                f"rejected={[int(f) for f in self.rejected_]}, rounds={self.rounds})")
 
 
 class _BaseBooster:
@@ -87,7 +116,9 @@ class _BaseBooster:
                  objective=None, alpha=0.9, tweedie_variance_power=1.5,
                  scale_pos_weight=1.0, subsample=1.0, colsample_bytree=1.0,
                  monotone_constraints=None, metric="auto",
-                 importance_type="gain", **aliases):
+                 importance_type="gain", feature_selection=False,
+                 selection_rounds=20, selection_alpha=0.05,
+                 allowed_features=None, **aliases):
         self.n_estimators = n_estimators
         self.max_depth = max_depth
         self.learning_rate = learning_rate
@@ -111,6 +142,10 @@ class _BaseBooster:
         self.monotone_constraints = monotone_constraints
         self.metric = metric
         self.importance_type = importance_type
+        self.feature_selection = feature_selection
+        self.selection_rounds = selection_rounds
+        self.selection_alpha = selection_alpha
+        self.allowed_features = allowed_features
         self._handle = None
         self.classes_ = None
         for key, value in aliases.items():
@@ -162,7 +197,36 @@ class _BaseBooster:
             cfg["monotone_constraints"] = list(self.monotone_constraints)
         if self.categorical_features:
             cfg["categorical_features"] = list(self.categorical_features)
+        if self.allowed_features is not None:
+            cfg["allowed_features"] = [int(f) for f in self.allowed_features]
         return cfg
+
+    def select_features(self, X, y, sample_weight=None, rounds=None,
+                        alpha=None, seed=0):
+        """Boruta shadow-feature selection, GPU-resident: each round
+        trains on [X | permuted copies of X] (shadows exist only as GPU
+        bin bytes) and a feature is confirmed / rejected by a binomial
+        test on how often its gain beats the best shadow. Returns a
+        FeatureSelection; use fit(feature_selection=True) to select and
+        train in one call."""
+        if not _core.native_available():
+            raise MacBoostError(
+                "feature selection requires the native Metal core "
+                "(Apple silicon, macOS 15+)")
+        cfg = self._config(0, 0)
+        cfg.pop("allowed_features", None)
+        y = self._encode_labels(y)
+        if self.classes_ is not None and len(self.classes_) > 2:
+            cfg["objective"] = "multiclass"
+            cfg["num_class"] = len(self.classes_)
+        hits, decision, ratio = _core.select_features(
+            cfg, X, y, sample_weight,
+            rounds=rounds if rounds is not None else self.selection_rounds,
+            alpha=alpha if alpha is not None else self.selection_alpha,
+            seed=seed)
+        return FeatureSelection(hits=hits, decision=decision, gain_ratio=ratio,
+                                rounds=rounds if rounds is not None
+                                else self.selection_rounds)
 
     def fit(self, X, y, eval_set=None, early_stopping_rounds=None, eval_every=0,
             sample_weight=None, init_model=None):
@@ -185,7 +249,19 @@ class _BaseBooster:
                   else early_stopping_rounds)
         if rounds and eval_set is None:
             raise ValueError("early stopping requires an eval_set")
+        selection = None
+        if self.feature_selection:
+            selection = self.select_features(X, y, sample_weight=sample_weight)
+            keep = selection.confirmed_
+            if len(keep) == 0:
+                keep = np.concatenate([selection.confirmed_, selection.tentative_])
+            if len(keep) == 0:
+                raise MacBoostError(
+                    "feature selection rejected every feature; the data "
+                    "may carry no signal (inspect select_features() output)")
         cfg = self._config(rounds, eval_every)
+        if self.feature_selection:
+            cfg["allowed_features"] = [int(f) for f in keep]
         y = self._encode_labels(y)
         if eval_set is not None and self.classes_ is not None and len(self.classes_) > 0:
             ev = eval_set if not isinstance(eval_set, list) else eval_set[0]
@@ -213,6 +289,9 @@ class _BaseBooster:
         import warnings as _warnings
         for w in _core.warnings_of(self._handle):
             _warnings.warn(w, UserWarning, stacklevel=2)
+        self.selection_result_ = selection
+        self.selected_features_ = (None if selection is None
+                                   else np.asarray(sorted(int(f) for f in keep)))
         return self
 
     def _raw_predict(self, X):

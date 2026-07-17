@@ -322,6 +322,81 @@ with _tf.TemporaryDirectory() as _tmp:
     gap = float(np.abs(pr_ours - pr_theirs).max())
     check(gap < 3e-4, f"onnx multiclass probabilities match (max gap {gap:.2e})")
 
+print("boruta feature selection (GPU-resident shadows)")
+Xsel = np.column_stack([X[:, :5], rng.random((len(X), 5), dtype=np.float32)])
+sel_est = MacBoostRegressor(n_estimators=60)
+sel = sel_est.select_features(Xsel, y)
+check(all(f < 5 for f in sel.confirmed_) and len(sel.confirmed_) >= 4,
+      f"signal features confirmed, noise never confirmed ({sel!r})")
+check(sum(f >= 5 for f in sel.rejected_) >= 4,
+      f"noise columns rejected ({[int(f) for f in sel.rejected_]})")
+check(all(sel.gain_ratio[f] > 1.5 for f in sel.confirmed_),
+      "confirmed features out-gain the shadow ceiling")
+m_sel = MacBoostRegressor(n_estimators=80, feature_selection=True).fit(Xsel, y)
+check(m_sel.selected_features_ is not None
+      and all(m_sel.feature_importances_[f] == 0 for f in range(5, 10)
+              if f not in m_sel.selected_features_),
+      f"fit(feature_selection=True) never splits on dropped features "
+      f"(kept {list(map(int, m_sel.selected_features_))})")
+rmse_sel = float(np.sqrt(np.mean((m_sel.predict(Xsel) - y) ** 2)))
+check(rmse_sel < 1.2, f"selected-feature model RMSE {rmse_sel:.3f} at noise floor")
+m_allow = MacBoostRegressor(n_estimators=30, allowed_features=[0, 1, 2, 3, 4]).fit(Xsel, y)
+check(all(m_allow.feature_importances_[5:] == 0),
+      "explicit allowed_features restricts splits")
+check(m_sel.selection_result_ is not None
+      and np.array_equal(m_sel.selected_features_,
+                         np.sort(m_sel.selection_result_.confirmed_)),
+      "selection_result_/selected_features_ exposed on the fitted model")
+
+# Classifier path with the flag, plus sample weights through selection.
+Xb_sel = np.column_stack([Xb, rng.random((len(Xb), 3), dtype=np.float32)])
+clf_sel = MacBoostClassifier(n_estimators=40, feature_selection=True,
+                             selection_rounds=10)
+clf_sel.fit(Xb_sel, yb, sample_weight=np.ones(len(Xb), np.float32))
+check(all(f < 4 for f in clf_sel.selected_features_)
+      and {0, 1}.issubset(set(map(int, clf_sel.selected_features_))),
+      f"classifier feature_selection keeps signal, drops noise "
+      f"(kept {list(map(int, clf_sel.selected_features_))})")
+acc_sel = float(np.mean(clf_sel.predict(Xb_sel) == yb))
+check(acc_sel > 0.79, f"selected classifier accuracy {acc_sel:.3f} > 0.79")
+
+# All-noise data: nothing may be confirmed; with enough rounds the
+# binomial test rejects everything and fit() fails loudly rather than
+# training a junk model.
+X_junk = rng.random((3_000, 4), dtype=np.float32)
+y_junk = rng.random(3_000, dtype=np.float32)
+sel_junk = MacBoostRegressor(n_estimators=20).select_features(
+    X_junk, y_junk, rounds=40)
+check(len(sel_junk.confirmed_) == 0,
+      f"all-noise data confirms nothing ({sel_junk!r})")
+# fit() on all-noise data either fails loudly (everything rejected) or
+# falls back to the tentative band only — it must never train on a
+# feature the test formally rejected.
+try:
+    m_junk = MacBoostRegressor(n_estimators=20, feature_selection=True,
+                               selection_rounds=40).fit(X_junk, y_junk)
+    kept = set(map(int, m_junk.selected_features_))
+    rejected = set(map(int, m_junk.selection_result_.rejected_))
+    check(len(m_junk.selection_result_.confirmed_) == 0 and not (kept & rejected),
+          f"all-noise fit kept only tentative features ({sorted(kept)})")
+except MacBoostError as e:
+    check("rejected every feature" in str(e),
+          "all-noise data fails loudly instead of training a junk model")
+
+# Invalid allowed_features surfaces the core's validation.
+try:
+    MacBoostRegressor(n_estimators=5, allowed_features=[99]).fit(Xg, yg)
+    raise SystemExit("expected MacBoostError for bad allowed_features")
+except MacBoostError as e:
+    check("allowedFeatures" in str(e), "out-of-range allowed_features rejected")
+
+# sklearn protocol still holds with the new params.
+from sklearn.base import clone as _clone
+est_sel = MacBoostRegressor(feature_selection=True, selection_rounds=7,
+                            selection_alpha=0.01, allowed_features=[1, 2])
+check(_clone(est_sel).get_params() == est_sel.get_params(),
+      "selection params round-trip through sklearn clone")
+
 print("tier 1+2 features")
 # Multiclass with arbitrary label values (auto-encoded).
 Xm3 = rng.random((8_000, 4), dtype=np.float32)

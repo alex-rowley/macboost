@@ -51,6 +51,9 @@ TRAIN OPTIONS:
   --goss                   gradient-based one-side sampling (faster training)
   --goss-top-rate <f>      GOSS top-gradient keep fraction              [default: 0.2]
   --goss-other-rate <f>    GOSS uniform sample fraction of the rest     [default: 0.1]
+  --feature-selection      Boruta shadow selection before training: only
+                           confirmed features may split (GPU-resident)
+  --selection-rounds <n>   Boruta rounds                               [default: 20]
   --early-stopping <n>     stop after n rounds without valid improvement
   --eval-every <n>         print metrics every n rounds                [default: 10]
   --format <f>             auto | csv | tsv | libsvm                   [default: auto]
@@ -77,7 +80,9 @@ func parseFlags(_ args: [String]) -> [String: String] {
     while i < args.count {
         guard args[i].hasPrefix("--") else { fail("unexpected argument '\(args[i])'") }
         let key = String(args[i].dropFirst(2))
-        if key == "raw" || key == "goss" { out[key] = "1"; i += 1; continue }
+        if key == "raw" || key == "goss" || key == "feature-selection" {
+            out[key] = "1"; i += 1; continue
+        }
         guard i + 1 < args.count else { fail("missing value for --\(key)") }
         out[key] = args[i + 1]
         i += 2
@@ -247,6 +252,25 @@ func runTrain(_ flags: [String: String]) {
             let evalSet = try loadValid(featureNames: featureNames)
             print("loaded \(table.rows) rows x \(featureNames.count) features " +
                   String(format: "in %.2fs", -t0.timeIntervalSinceNow))
+            if flags["feature-selection"] != nil {
+                let selector = try MacBooster(params: params)
+                let rounds = Int(flags["selection-rounds"] ?? "20") ?? 20
+                let sel = try selector.selectFeatures(
+                    featureMajor: X, rows: table.rows, cols: featureNames.count,
+                    labels: y, weights: weights, rounds: rounds) { print($0) }
+                for f in sel.rejected {
+                    print("  rejected: \(featureNames[f]) " +
+                          String(format: "(beat shadows %d/%d rounds)", sel.hits[f], rounds))
+                }
+                let keep = sel.confirmed.isEmpty
+                    ? sel.confirmed + sel.tentative : sel.confirmed
+                guard !keep.isEmpty else {
+                    fail("feature selection rejected every feature; no signal found")
+                }
+                print("keeping \(keep.count)/\(featureNames.count) features: " +
+                      keep.map { featureNames[$0] }.joined(separator: ", "))
+                params.allowedFeatures = Set(keep)
+            }
             booster = try MacBooster(params: params)
             print("training on \(booster.deviceName)")
             if let dsPath = flags["save-dataset"] {

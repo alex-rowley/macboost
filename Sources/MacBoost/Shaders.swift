@@ -917,6 +917,45 @@ kernel void predict_forest(
     }
 }
 
+struct ShadowParams { uint numSamples; uint numFeatures; uint halfBits; uint seed; };
+
+// Bijective pseudo-random permutation of [0, n): a 4-round Feistel network
+// over the enclosing power-of-two domain with cycle-walking. Lets every
+// thread compute its own permuted index — no sort, no stored index array.
+inline uint shadow_perm(uint i, uint n, uint hb, uint seed) {
+    uint mask = (1u << hb) - 1u;
+    do {
+        uint L = i >> hb, R = i & mask;
+        for (uint r = 0; r < 4; ++r) {
+            uint t = R;
+            R = L ^ (wang_hash(R ^ (seed + r * 0x9E3779B9u)) & mask);
+            L = t;
+        }
+        i = (L << hb) | R;
+    } while (i >= n);
+    return i;
+}
+
+// Boruta shadow features without materialising any data: copy the binned
+// matrix into the first half of a double-width tiled matrix and fill the
+// second half with row-permuted copies of each column (fresh permutation
+// per column per round via the seed). Bin edges are permutation-invariant,
+// so shadows never exist as raw values anywhere — GPU bin bytes only.
+kernel void shadow_bins(
+    device const uchar   *src [[buffer(0)]],   // tiled, numFeatures wide
+    device uchar         *dst [[buffer(1)]],   // tiled, 2*numFeatures wide
+    constant ShadowParams &p  [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint i = gid.x, f = gid.y;
+    if (i >= p.numSamples || f >= p.numFeatures) return;
+    dst[bin_index(f, i, p.numSamples)] = src[bin_index(f, i, p.numSamples)];
+    uint j = shadow_perm(i, p.numSamples, p.halfBits,
+                         p.seed ^ wang_hash(f + 1u));
+    dst[bin_index(p.numFeatures + f, i, p.numSamples)] =
+        src[bin_index(f, j, p.numSamples)];
+}
+
 // One root-to-leaf path split, precomputed on the host (GPUTreeSHAP-style
 // path decomposition: the recursive TreeSHAP sum distributes over leaves).
 struct ShapElement {

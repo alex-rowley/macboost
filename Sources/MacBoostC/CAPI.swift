@@ -32,6 +32,44 @@ private struct CConfig: Codable {
     var metric: String?
     var num_class: Int?
     var init_model: String?
+    var allowed_features: [Int]?
+}
+
+private func makeParams(_ cfg: CConfig) throws -> BoosterParams {
+    var p = BoosterParams()
+    if let v = cfg.num_trees { p.numTrees = v }
+    if let v = cfg.max_depth { p.maxDepth = v }
+    if let v = cfg.learning_rate { p.learningRate = v }
+    if let v = cfg.lambda { p.lambda = v }
+    if let v = cfg.min_child_weight { p.minChildHess = v }
+    if let v = cfg.min_split_gain { p.minSplitGain = v }
+    if let v = cfg.num_bins { p.numBins = v }
+    if let v = cfg.categorical_features { p.categoricalFeatures = Set(v) }
+    if let v = cfg.cat_smooth { p.catSmooth = v }
+    if let v = cfg.goss { p.goss = v }
+    if let v = cfg.goss_top_rate { p.gossTopRate = v }
+    if let v = cfg.goss_other_rate { p.gossOtherRate = v }
+    if let v = cfg.alpha { p.alpha = v }
+    if let v = cfg.tweedie_variance_power { p.tweedieVariancePower = v }
+    if let v = cfg.scale_pos_weight { p.scalePosWeight = v }
+    if let v = cfg.subsample { p.subsample = v }
+    if let v = cfg.feature_fraction { p.featureFraction = v }
+    if let v = cfg.monotone_constraints { p.monotoneConstraints = v }
+    if let v = cfg.num_class { p.numClasses = v }
+    if let v = cfg.allowed_features { p.allowedFeatures = Set(v) }
+    if let v = cfg.metric, let m = EvalMetric(rawValue: v) { p.metric = m }
+    switch cfg.objective ?? "regression" {
+    case "regression", "l2", "mse": p.objective = .regression
+    case "binary": p.objective = .binaryLogistic
+    case "mae", "l1", "regression_l1": p.objective = .mae
+    case "huber": p.objective = .huber
+    case "quantile": p.objective = .quantile
+    case "poisson": p.objective = .poisson
+    case "tweedie": p.objective = .tweedie
+    case "multiclass", "softmax": p.objective = .multiclass
+    case let o: throw MacBoostError.internalError("unknown objective '\(o)'")
+    }
+    return p
 }
 
 private func setError(_ err: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?,
@@ -61,40 +99,7 @@ public func macboost_train(
             let data = Data(String(cString: paramsJSON).utf8)
             cfg = try JSONDecoder().decode(CConfig.self, from: data)
         }
-        var p = BoosterParams()
-        if let v = cfg.num_trees { p.numTrees = v }
-        if let v = cfg.max_depth { p.maxDepth = v }
-        if let v = cfg.learning_rate { p.learningRate = v }
-        if let v = cfg.lambda { p.lambda = v }
-        if let v = cfg.min_child_weight { p.minChildHess = v }
-        if let v = cfg.min_split_gain { p.minSplitGain = v }
-        if let v = cfg.num_bins { p.numBins = v }
-        if let v = cfg.categorical_features { p.categoricalFeatures = Set(v) }
-        if let v = cfg.cat_smooth { p.catSmooth = v }
-        if let v = cfg.goss { p.goss = v }
-        if let v = cfg.goss_top_rate { p.gossTopRate = v }
-        if let v = cfg.goss_other_rate { p.gossOtherRate = v }
-        if let v = cfg.alpha { p.alpha = v }
-        if let v = cfg.tweedie_variance_power { p.tweedieVariancePower = v }
-        if let v = cfg.scale_pos_weight { p.scalePosWeight = v }
-        if let v = cfg.subsample { p.subsample = v }
-        if let v = cfg.feature_fraction { p.featureFraction = v }
-        if let v = cfg.monotone_constraints { p.monotoneConstraints = v }
-        if let v = cfg.num_class { p.numClasses = v }
-        if let v = cfg.metric, let m = EvalMetric(rawValue: v) { p.metric = m }
-        switch cfg.objective ?? "regression" {
-        case "regression", "l2", "mse": p.objective = .regression
-        case "binary": p.objective = .binaryLogistic
-        case "mae", "l1", "regression_l1": p.objective = .mae
-        case "huber": p.objective = .huber
-        case "quantile": p.objective = .quantile
-        case "poisson": p.objective = .poisson
-        case "tweedie": p.objective = .tweedie
-        case "multiclass", "softmax": p.objective = .multiclass
-        case let o: throw MacBoostError.internalError("unknown objective '\(o)'")
-        }
-
-        let b = try MacBooster(params: p)
+        let b = try MacBooster(params: makeParams(cfg))
         let X = Array(UnsafeBufferPointer(start: x, count: Int(rows * cols)))
         let Y = Array(UnsafeBufferPointer(start: y, count: Int(rows)))
         var evalSet: EvalSet?
@@ -120,6 +125,52 @@ public func macboost_train(
     } catch {
         setError(err, "\(error)")
         return nil
+    }
+}
+
+@_cdecl("macboost_select_features")
+public func macboost_select_features(
+    _ paramsJSON: UnsafePointer<CChar>?,
+    _ x: UnsafePointer<Float>?, _ rows: Int64, _ cols: Int64,
+    _ y: UnsafePointer<Float>?,
+    _ w: UnsafePointer<Float>?,
+    _ rounds: Int32, _ alpha: Float, _ seed: Int64,
+    _ outHits: UnsafeMutablePointer<Int32>?,      // cols entries
+    _ outDecision: UnsafeMutablePointer<Int32>?,  // 2 confirmed / 1 tentative / 0 rejected
+    _ outGainRatio: UnsafeMutablePointer<Float>?, // cols entries
+    _ err: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    do {
+        guard let x, let y, rows > 0, cols > 0,
+              let outHits, let outDecision, let outGainRatio else {
+            throw MacBoostError.internalError("null or empty selection input")
+        }
+        var cfg = CConfig()
+        if let paramsJSON {
+            let data = Data(String(cString: paramsJSON).utf8)
+            cfg = try JSONDecoder().decode(CConfig.self, from: data)
+        }
+        let verbose = cfg.verbose ?? false
+        let b = try MacBooster(params: makeParams(cfg))
+        let X = Array(UnsafeBufferPointer(start: x, count: Int(rows * cols)))
+        let Y = Array(UnsafeBufferPointer(start: y, count: Int(rows)))
+        let weights = w.map { Array(UnsafeBufferPointer(start: $0, count: Int(rows))) }
+        let result = try b.selectFeatures(
+            featureMajor: X, rows: Int(rows), cols: Int(cols), labels: Y,
+            weights: weights, rounds: Int(rounds), alpha: Double(alpha),
+            seed: UInt64(bitPattern: seed),
+            progress: verbose ? { print($0) } : nil)
+        for f in 0..<Int(cols) {
+            outHits[f] = Int32(result.hits[f])
+            outDecision[f] = 1
+            outGainRatio[f] = result.gainRatio[f]
+        }
+        for f in result.confirmed { outDecision[f] = 2 }
+        for f in result.rejected { outDecision[f] = 0 }
+        return 0
+    } catch {
+        setError(err, String(describing: error))
+        return 1
     }
 }
 
