@@ -8,7 +8,7 @@ idle while LightGBM saturates your CPU cores. MacBoost fixes that: the full
 XGBoost/LightGBM histogram algorithm, written from scratch as Metal compute
 kernels, with a scikit-learn-compatible Python API, a LightGBM-style CLI,
 and a zero-dependency Swift core. On the canonical HIGGS benchmark (10.5M
-rows) it trains in **3.0 seconds against LightGBM's 10.3 and XGBoost's
+rows) it trains in **2.8 seconds against LightGBM's 10.3 and XGBoost's
 9.3 — at equal AUC** — and up to 11× ahead on wider data.
 
 It is not a wrapper and not a port: no CUDA translation layer, no
@@ -59,7 +59,7 @@ papers, standard protocol (last 500k rows as test):
 
 | library | fit time | test AUC |
 |---|---|---|
-| **MacBoost** | **3.0s** | 0.8128 |
+| **MacBoost** | **2.8s** | 0.8128 |
 | **MacBoost + GOSS** | **1.9s** | 0.8129 |
 | XGBoost hist | 9.3s | 0.8128 |
 | LightGBM | 10.3s | 0.8125 |
@@ -76,6 +76,12 @@ papers, standard protocol (last 500k rows as test):
 GOSS (off by default, as in LightGBM) adds another ~1.5–1.8×: 1M in 0.36s,
 10M in 2.0s, at ≤0.004 RMSE cost. Inference is GPU-accelerated too: 500k
 rows through 100 trees in 0.03s.
+
+**Small datasets: use fewer bins.** Histogram maintenance scales with
+`max_bin` regardless of row count, while split resolution stops improving
+once bins exceed your rows-per-node — so below ~100k rows, `max_bin=64`
+(or 32) is typically 2–4× faster with identical accuracy. `fit` warns
+when your configuration is in this territory.
 
 **Reproduce:**
 
@@ -119,7 +125,7 @@ dependencies):
 ```sh
 git clone https://github.com/alex-rowley/macboost && cd macboost
 swift build -c release        # library, CLI (.build/release/macboost), dylib
-swift test                    # 50 behavioural tests
+swift test                    # 75 behavioural tests
 ./scripts/build_wheel.sh && pip install python/dist/*.whl
 ```
 
@@ -170,6 +176,7 @@ as aliases:
 | `min_split_gain` | `min_gain_to_split` | `gamma`, `min_split_loss` |
 | `min_child_weight` | `min_sum_hessian_in_leaf` | `min_child_weight` |
 | `max_bin` | `max_bin` (macboost's count includes the reserved missing bin) | `max_bin` |
+| `num_leaves` | `num_leaves` (enables best-first growth; `max_depth` caps the path) | `max_leaves` |
 | `categorical_features` | `categorical_feature` | (dtype-based) |
 | `subsample` | `bagging_fraction` | `subsample` |
 | `colsample_bytree` | `feature_fraction` | `colsample_bytree` |
@@ -283,6 +290,10 @@ sel = MacBoostRegressor().select_features(X, y, rounds=20)    # selection only
 sel.confirmed_, sel.tentative_, sel.rejected_
 ```
 
+The disposable probe models default to `min(n_estimators, 100)` boosting
+rounds — Boruta needs gain-vs-shadow votes, not converged ensembles. Tune
+with `selection_estimators=` (40–50 is the cheapest sound setting).
+
 CLI: `macboost train --feature-selection [--selection-rounds 20] ...`
 
 Implementation is unique to this engine: shadows never exist as data.
@@ -308,7 +319,8 @@ LightGBM and XGBoost train on silently.
 
 ## How it works
 
-Classic histogram GBDT (level-wise growth, second-order gain), where every
+Classic histogram GBDT (level-wise or best-first growth, second-order
+gain), where every
 stage is a Metal kernel and **an entire tree is one GPU command buffer** —
 `decide_splits` picks splits on-device and writes the *next* level's
 dispatch arguments (indirect dispatch), so training has zero per-level CPU
@@ -355,7 +367,7 @@ within ±0.03 of alpha).
 
 ## Tests
 
-`swift test` runs 50 behavioural tests adapted from the LightGBM and
+`swift test` runs 75 behavioural tests adapted from the LightGBM and
 XGBoost open-source suites (upstream sources cited per test in
 `Tests/MacBoostTests/`):
 
