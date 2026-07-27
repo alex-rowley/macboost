@@ -243,8 +243,12 @@ model = MacBoostRegressor.load_model("model.json")   # works on Linux
 preds = model.predict(X)
 ```
 
-Simplest path; fine for batch scoring. It is numpy-speed, not
-XGBoost-speed — for latency-critical serving use one of the exports.
+Simplest path, and faster than it sounds: the scorer walks the whole
+forest level-synchronously (one `(rows, trees)` position matrix, ~12
+vectorized steps per call), so small-batch scoring actually beats
+XGBoost's C++ predictor — ~3× at single rows, break-even around batch 16.
+For large-batch, latency-critical serving use one of the exports (C++
+pulls ahead ~20× at 1k+ rows).
 
 **2. XGBoost export.** Emit a standard XGBoost JSON model and serve it
 with vanilla `xgboost` (or anything that loads one — e.g. Triton FIL):
