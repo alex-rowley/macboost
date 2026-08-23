@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["numpy", "scikit-learn", "xgboost", "onnx", "onnxruntime"]
+# dependencies = ["numpy", "scikit-learn", "xgboost", "onnx", "onnxruntime", "mlx", "torch"]
 # ///
 """Python binding tests: regression, classification, missing values,
 categoricals, early stopping, and save/load prediction parity.
@@ -495,5 +495,33 @@ check(m_b.n_trees_ == 40, "init_model warm start extends the ensemble")
 auc_m = MacBoostClassifier(n_estimators=60, eval_metric="auc")
 auc_m.fit(Xb, yb, eval_set=(Xb[:4000], yb[:4000]), early_stopping_rounds=15)
 check(auc_m.best_iteration_ is not None, "auc metric drives early stopping")
+
+# Array interop: MLX arrays and torch tensors in, same family out.
+import mlx.core as mx
+import torch
+Xmx, ymx = mx.array(Xg), mx.array(yg)
+check(np.asarray(Xmx).ctypes.data == np.asarray(Xmx).ctypes.data
+      and np.shares_memory(np.asarray(Xmx), np.asarray(Xmx)),
+      "mlx array -> numpy is a zero-copy unified-memory view")
+m_np = MacBoostRegressor(n_estimators=30).fit(Xg, yg, eval_set=(Xg[:500], yg[:500]))
+m_mx = MacBoostRegressor(n_estimators=30).fit(Xmx, ymx, eval_set=(Xmx[:500], ymx[:500]))
+p_np, p_mx = m_np.predict(Xg), m_mx.predict(Xmx)
+check(isinstance(p_mx, mx.array) and np.allclose(np.asarray(p_mx), p_np, atol=1e-6),
+      "fit/predict on mlx arrays matches numpy and returns mx.array")
+c_mx = m_mx.predict_contrib(Xmx[:50])
+check(isinstance(c_mx, mx.array)
+      and np.allclose(np.asarray(c_mx), m_np.predict_contrib(Xg[:50]), atol=1e-5),
+      "predict_contrib on mlx arrays returns mx.array")
+Xt = torch.from_numpy(Xg).to("mps")
+p_t = m_np.predict(Xt)
+check(p_t.device.type == "mps" and np.allclose(p_t.cpu().numpy(), p_np, atol=1e-6),
+      "torch MPS tensor in -> MPS tensor out, same predictions")
+clf_mx = MacBoostClassifier(n_estimators=20).fit(Xmx, mx.array((yg > yg.mean()).astype(np.int32)))
+pr = clf_mx.predict_proba(Xmx)
+check(isinstance(pr, mx.array) and abs(float(np.asarray(pr).sum(axis=1).mean()) - 1) < 1e-6,
+      "predict_proba on mlx arrays returns mx.array summing to 1")
+check(isinstance(clf_mx.predict(Xmx), mx.array), "integer labels come back as mx.array")
+check(isinstance(clf_mx.score(Xmx, mx.array((yg > yg.mean()).astype(np.int32))), float),
+      "score accepts mlx arrays")
 
 print(f"\nPython binding tests PASSED ({checks} checks)")

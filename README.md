@@ -164,6 +164,22 @@ The estimators implement the scikit-learn protocol, so `clone`,
 `Pipeline`, `GridSearchCV`, `cross_val_score` and Optuna work out of the
 box — sklearn itself remains an optional dependency.
 
+**MLX and PyTorch arrays work directly.** `fit`, `predict`,
+`predict_proba` and `predict_contrib` accept `mx.array` and
+`torch.Tensor` (including MPS tensors) and hand results back in the same
+family. MLX arrays share unified memory with the Metal core, so an MLX
+embedding pipeline feeds the booster with no copy:
+
+```python
+import mlx.core as mx
+emb = mlx_model(tokens)                      # mx.array, stays in unified memory
+model = MacBoostClassifier(n_estimators=300).fit(emb, mx.array(labels))
+probs = model.predict_proba(emb_test)        # mx.array out
+```
+
+This is interop, not acceleration — the training and scoring kernels are
+MacBoost's own Metal code; MLX's graph machinery is not involved.
+
 **Coming from LightGBM or XGBoost?** Parameters use the dialect their
 sklearn wrappers share, and the well-known native spellings are accepted
 as aliases:
@@ -389,9 +405,9 @@ XGBoost open-source suites (upstream sources cited per test in
   to identical predictions; `.mbds`-trained ≡ raw-trained
 - End-to-end surfaces: `scripts/test_cli.sh` (CSV/TSV/LibSVM/mbds/
   multiclass/importance flows) and `uv run scripts/test_python.py`
-  (35 checks: sklearn interop incl. real GridSearchCV/cross_val_score
+  (74 checks: sklearn interop incl. real GridSearchCV/cross_val_score
   runs, objectives, weights, multiclass with string labels, SHAP,
-  guardrails)
+  guardrails, MLX/PyTorch array interop)
 
 These tests caught real bugs during development — a double-applied
 learning rate under bagging, a monotonicity leak from crossed bounds in
