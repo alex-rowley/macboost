@@ -17,7 +17,7 @@ cross_val_score work.
 
 import numpy as np
 
-from . import _core
+from . import _core, _interop
 from ._core import MacBoostError
 
 # scikit-learn is optional: when present, inheriting its base classes gives
@@ -227,6 +227,8 @@ class _BaseBooster:
                 "(Apple silicon, macOS 15+)")
         cfg = self._config(0, 0)
         cfg.pop("allowed_features", None)
+        X, y = _interop.to_numpy(X), _interop.to_numpy(y)
+        sample_weight = _interop.to_numpy(sample_weight)
         y = self._encode_labels(y)
         if self.classes_ is not None and len(self.classes_) > 2:
             cfg["objective"] = "multiclass"
@@ -256,10 +258,14 @@ class _BaseBooster:
         eval_set: (X_valid, y_valid) tuple, or [(X_valid, y_valid)] in the
         LightGBM/XGBoost list style. early_stopping_rounds here overrides
         the constructor value (both places accepted, like XGBoost)."""
+        X, y = _interop.to_numpy(X), _interop.to_numpy(y)
+        sample_weight = _interop.to_numpy(sample_weight)
         if isinstance(eval_set, list):
             if len(eval_set) != 1:
                 raise ValueError("only a single eval_set is supported")
             eval_set = eval_set[0]
+        if eval_set is not None:
+            eval_set = tuple(_interop.to_numpy(a) for a in eval_set)
         rounds = (self.early_stopping_rounds if early_stopping_rounds is None
                   else early_stopping_rounds)
         if rounds and eval_set is None:
@@ -310,6 +316,7 @@ class _BaseBooster:
         return self
 
     def _raw_predict(self, X):
+        X = _interop.to_numpy(X)
         if getattr(self, "_pymodel", None) is not None:
             return self._pymodel.predict_raw(np.asarray(X, dtype=np.float32))
         if self._handle is None:
@@ -344,7 +351,8 @@ class _BaseBooster:
                 "or score contributions on a Mac")
         if self._handle is None:
             raise MacBoostError("model is not fitted")
-        return _core.predict_contrib(self._handle, X)
+        return _interop.wrapper_for(X)(
+            _core.predict_contrib(self._handle, _interop.to_numpy(X)))
 
     def save_xgboost(self, path):
         """Export as an XGBoost JSON model for deployment anywhere xgboost
@@ -403,14 +411,16 @@ class MacBoostRegressor(_SkRegressor, _BaseBooster, _SkBase):
     _estimator_type = "regressor"
 
     def predict(self, X):
+        wrap = _interop.wrapper_for(X)
         if getattr(self, "_pymodel", None) is not None:
-            return self._pymodel.predict(np.asarray(X, dtype=np.float32))
-        return self._raw_predict(X)
+            return wrap(self._pymodel.predict(
+                np.asarray(_interop.to_numpy(X), dtype=np.float32)))
+        return wrap(self._raw_predict(X))
 
     def score(self, X, y):
         """R^2, per the scikit-learn regressor contract."""
-        y = np.asarray(y, dtype=np.float64).ravel()
-        pred = self.predict(X).astype(np.float64)
+        y = np.asarray(_interop.to_numpy(y), dtype=np.float64).ravel()
+        pred = np.asarray(_interop.to_numpy(self.predict(X)), dtype=np.float64)
         ss_res = float(np.sum((y - pred) ** 2))
         ss_tot = float(np.sum((y - y.mean()) ** 2))
         return 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
@@ -436,7 +446,7 @@ class MacBoostClassifier(_SkClassifier, _BaseBooster, _SkBase):
         lookup = {c: i for i, c in enumerate(self.classes_)}
         return np.asarray([lookup[v] for v in y], dtype=np.float32)
 
-    def predict_proba(self, X):
+    def _proba_np(self, X):
         raw = self._raw_predict(X).astype(np.float64)
         if raw.ndim == 2:                       # multiclass softmax
             e = np.exp(raw - raw.max(axis=1, keepdims=True))
@@ -444,11 +454,16 @@ class MacBoostClassifier(_SkClassifier, _BaseBooster, _SkBase):
         p = 1.0 / (1.0 + np.exp(-raw))
         return np.column_stack([1 - p, p])
 
+    def predict_proba(self, X):
+        return _interop.wrapper_for(X)(self._proba_np(X))
+
     def predict(self, X):
-        idx = np.argmax(self.predict_proba(X), axis=1)
+        idx = np.argmax(self._proba_np(X), axis=1)
         classes = self.classes_ if self.classes_ is not None else np.array([0, 1])
-        return classes[idx]
+        out = classes[idx]
+        return _interop.wrapper_for(X)(out) if out.dtype.kind in "biuf" else out
 
     def score(self, X, y):
         """Accuracy, per the scikit-learn classifier contract."""
-        return float(np.mean(self.predict(X) == np.asarray(y).ravel()))
+        pred = _interop.to_numpy(self.predict(X))
+        return float(np.mean(pred == np.asarray(_interop.to_numpy(y)).ravel()))
