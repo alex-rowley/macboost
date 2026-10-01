@@ -65,7 +65,8 @@ _ALIASES = {
 _PARAM_NAMES = (
     "n_estimators", "max_depth", "learning_rate", "num_leaves", "reg_lambda",
     "min_child_weight", "min_split_gain", "max_bin", "categorical_features",
-    "cat_smooth", "early_stopping_rounds", "verbose",
+    "cat_smooth", "cat_l2", "min_data_per_group", "max_cat_threshold",
+    "early_stopping_rounds", "verbose",
     "goss", "goss_top_rate", "goss_other_rate",
     "objective", "alpha", "tweedie_variance_power", "scale_pos_weight",
     "subsample", "colsample_bytree", "monotone_constraints", "metric",
@@ -113,6 +114,7 @@ class _BaseBooster:
                  num_leaves=None,
                  reg_lambda=1.0, min_child_weight=1.0, min_split_gain=0.0,
                  max_bin=256, categorical_features=None, cat_smooth=10.0,
+                 cat_l2=10.0, min_data_per_group=100, max_cat_threshold=32,
                  early_stopping_rounds=0, verbose=False,
                  goss=False, goss_top_rate=0.2, goss_other_rate=0.1,
                  objective=None, alpha=0.9, tweedie_variance_power=1.5,
@@ -132,6 +134,9 @@ class _BaseBooster:
         self.max_bin = max_bin
         self.categorical_features = categorical_features
         self.cat_smooth = cat_smooth
+        self.cat_l2 = cat_l2
+        self.min_data_per_group = min_data_per_group
+        self.max_cat_threshold = max_cat_threshold
         self.early_stopping_rounds = early_stopping_rounds
         self.verbose = verbose
         self.goss = goss
@@ -184,6 +189,9 @@ class _BaseBooster:
             "num_bins": self.max_bin,
             "objective": objective,
             "cat_smooth": self.cat_smooth,
+            "cat_l2": self.cat_l2,
+            "min_data_per_group": self.min_data_per_group,
+            "max_cat_threshold": self.max_cat_threshold,
             "early_stopping_rounds": early_stopping_rounds,
             "eval_every": eval_every,
             "verbose": self.verbose,

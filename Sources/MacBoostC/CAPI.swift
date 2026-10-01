@@ -17,6 +17,9 @@ private struct CConfig: Codable {
     var objective: String?
     var categorical_features: [Int]?
     var cat_smooth: Float?
+    var cat_l2: Float?
+    var min_data_per_group: Int?
+    var max_cat_threshold: Int?
     var early_stopping_rounds: Int?
     var eval_every: Int?
     var verbose: Bool?
@@ -47,6 +50,9 @@ private func makeParams(_ cfg: CConfig) throws -> BoosterParams {
     if let v = cfg.num_bins { p.numBins = v }
     if let v = cfg.categorical_features { p.categoricalFeatures = Set(v) }
     if let v = cfg.cat_smooth { p.catSmooth = v }
+    if let v = cfg.cat_l2 { p.catL2 = v }
+    if let v = cfg.min_data_per_group { p.minDataPerGroup = v }
+    if let v = cfg.max_cat_threshold { p.maxCatThreshold = v }
     if let v = cfg.goss { p.goss = v }
     if let v = cfg.goss_top_rate { p.gossTopRate = v }
     if let v = cfg.goss_other_rate { p.gossOtherRate = v }

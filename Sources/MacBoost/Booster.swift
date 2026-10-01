@@ -26,6 +26,13 @@ public struct BoosterParams {
     public var objective = Objective.regression
     public var categoricalFeatures: Set<Int> = []   // column indices; values 0..<numBins-1
     public var catSmooth: Float = 10   // denominator smoothing in category ordering
+    /// Categorical split regularisers, LightGBM's defaults. Without them a
+    /// high-cardinality categorical fits noise at deep nodes (sorting ~k
+    /// categories by gradient mean has ~k degrees of freedom) and starves
+    /// real numeric features of splits.
+    public var catL2: Float = 10            // extra L2 in categorical split gain
+    public var minDataPerGroup: Int = 100   // categories with fewer rows route right
+    public var maxCatThreshold: Int = 32    // max categories on the left side
     /// GOSS (gradient-based one-side sampling): train each tree on the
     /// top `gossTopRate` fraction of samples by |gradient| plus a uniform
     /// `gossOtherRate` sample of the rest (gradients amplified by
@@ -179,6 +186,7 @@ private struct DecideParams {
     var levelStart: UInt32; var numLevel: UInt32; var numFeatures: UInt32; var numBins: UInt32
     var numTiles: UInt32; var samplesPerGroup: UInt32; var isLastLevel: UInt32
     var lambda: Float; var learningRate: Float; var minSplitGain: Float; var catSmooth: Float
+    var minDataPerGroup: Float
 }
 private struct FinalParams {
     var lastStart: UInt32; var numLast: UInt32; var lambda: Float; var learningRate: Float
@@ -188,6 +196,7 @@ private struct LWParamsHost {
     var sliceLen: UInt32; var numFeatures: UInt32; var numBins: UInt32
     var numTiles: UInt32; var numSamples: UInt32
     var lambda: Float; var learningRate: Float; var minSplitGain: Float; var catSmooth: Float
+    var minDataPerGroup: Float; var pad0: UInt32 = 0; var pad1: UInt32 = 0; var pad2: UInt32 = 0
 }
 
 private struct LWSpecHost {
@@ -205,6 +214,7 @@ private struct SplitParams {
     var numFeatures: UInt32; var numBins: UInt32; var numNodes: UInt32
     var lambda: Float; var minChildHess: Float; var minSplitGain: Float; var catSmooth: Float
     var levelStart: UInt32
+    var catL2: Float; var minDataPerGroup: Float; var maxCatThreshold: UInt32; var pad0: UInt32 = 0
 }
 private struct SplitResult {
     var gain: Float; var bin: UInt32; var gl: Float; var hl: Float; var flags: UInt32
@@ -271,6 +281,15 @@ public final class MacBooster {
         }
         guard params.learningRate.isFinite && params.learningRate > 0 else {
             throw MacBoostError.invalidInput("learningRate must be positive and finite")
+        }
+        guard params.catSmooth >= 0 && params.catL2 >= 0 else {
+            throw MacBoostError.invalidInput("catSmooth and catL2 must be >= 0")
+        }
+        guard params.minDataPerGroup >= 0 else {
+            throw MacBoostError.invalidInput("minDataPerGroup must be >= 0")
+        }
+        guard params.maxCatThreshold >= 1 else {
+            throw MacBoostError.invalidInput("maxCatThreshold must be >= 1")
         }
         if params.goss {
             guard params.gossTopRate > 0 && params.gossOtherRate > 0
@@ -969,7 +988,8 @@ public final class MacBooster {
             numFeatures: UInt32(cols), numBins: UInt32(nBins),
             numTiles: UInt32(numTiles), numSamples: UInt32(rows),
             lambda: lambda, learningRate: lr,
-            minSplitGain: params.minSplitGain, catSmooth: params.catSmooth)
+            minSplitGain: params.minSplitGain, catSmooth: params.catSmooth,
+            minDataPerGroup: Float(params.minDataPerGroup))
         let maxSegGroups = (rows + lwSpg - 1) / lwSpg
         func growLeafWiseTree(t: Int, classIdx: Int) throws {
             gossActive = params.goss && t >= gossWarmup
@@ -1108,7 +1128,10 @@ public final class MacBooster {
                                            minChildHess: params.minChildHess,
                                            minSplitGain: params.minSplitGain,
                                            catSmooth: params.catSmooth,
-                                           levelStart: 0),
+                                           levelStart: 0,
+                                           catL2: params.catL2,
+                                           minDataPerGroup: Float(params.minDataPerGroup),
+                                           maxCatThreshold: UInt32(params.maxCatThreshold)),
                        grid: MTLSize(width: cols, height: 1, depth: 1),
                        threadgroup: tg1D)
             e.dispatch("leaf_init",
@@ -1155,7 +1178,10 @@ public final class MacBooster {
                                                    minChildHess: params.minChildHess,
                                                    minSplitGain: params.minSplitGain,
                                                    catSmooth: params.catSmooth,
-                                                   levelStart: 1),
+                                                   levelStart: 1,
+                                                   catL2: params.catL2,
+                                                   minDataPerGroup: Float(params.minDataPerGroup),
+                                                   maxCatThreshold: UInt32(params.maxCatThreshold)),
                                indirect: lwArgsFind, threadgroup: tg1D)
                     continue
                 }
@@ -1221,7 +1247,10 @@ public final class MacBooster {
                                                minChildHess: params.minChildHess,
                                                minSplitGain: params.minSplitGain,
                                                catSmooth: params.catSmooth,
-                                               levelStart: 0),
+                                               levelStart: 0,
+                                               catL2: params.catL2,
+                                               minDataPerGroup: Float(params.minDataPerGroup),
+                                               maxCatThreshold: UInt32(params.maxCatThreshold)),
                            grid: MTLSize(width: cols, height: 2, depth: 1),
                            threadgroup: tg1D)
             }
@@ -1519,7 +1548,10 @@ public final class MacBooster {
                                                     minChildHess: params.minChildHess,
                                                     minSplitGain: params.minSplitGain,
                                                     catSmooth: params.catSmooth,
-                                                    levelStart: UInt32(levelStart)),
+                                                    levelStart: UInt32(levelStart),
+                                                    catL2: params.catL2,
+                                                    minDataPerGroup: Float(params.minDataPerGroup),
+                                                    maxCatThreshold: UInt32(params.maxCatThreshold)),
                                 grid: MTLSize(width: cols, height: numLevel, depth: 1),
                                 threadgroup: tg1D)
                 let nextLevel = min(d + 1, maxDepth - 1)
@@ -1541,7 +1573,8 @@ public final class MacBooster {
                                                      lambda: lambda,
                                                      learningRate: lr,
                                                      minSplitGain: params.minSplitGain,
-                                                     catSmooth: params.catSmooth),
+                                                     catSmooth: params.catSmooth,
+                                                     minDataPerGroup: Float(params.minDataPerGroup)),
                                 grid: MTLSize(width: tgSize, height: 1, depth: 1),
                                 threadgroup: tg1D)
             }
