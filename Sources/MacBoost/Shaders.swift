@@ -329,20 +329,27 @@ struct SplitParams {
     uint numFeatures; uint numBins; uint numNodes;
     float lambda; float minChildHess; float minSplitGain; float catSmooth;
     uint levelStart;
+    float catL2; float minDataPerGroup; uint maxCatThreshold; uint pad0;
 };
 
 struct SplitResult { float gain; uint bin; float gl; float hl; uint flags; };
 
-// Stable ascending insertion sort of non-empty bins by g/(h + smooth) —
-// LightGBM's Fisher ordering. Shared by find_splits (to score subsets) and
-// decide_splits (to reconstruct the winning subset's bitmask).
+// Stable ascending insertion sort of eligible bins by g/(h + smooth) —
+// LightGBM's Fisher ordering. Categories with fewer than minDataPerGroup
+// rows are left out (they always route right), as in LightGBM: at deep
+// nodes a high-cardinality feature spreads a few rows per category, and
+// sorting those by their gradient mean fits noise with ~k degrees of
+// freedom. Shared by find_splits (to score subsets) and the decide /
+// leaf-wise apply kernels (to reconstruct the winning subset's bitmask),
+// so every caller must pass the same minDataPerGroup.
 inline int cat_sort(device const float *h, uint numBins, float catSmooth,
+                    float minDataPerGroup,
                     thread ushort *order_, thread float *key)
 {
     int m = 0;
     for (uint b = 0; b < numBins; ++b) {
         float hb = h[b*HIST_CH+1];
-        if (hb > 0.0f) {
+        if (hb > 0.0f && h[b*HIST_CH+2] >= minDataPerGroup) {
             order_[m] = ushort(b);
             key[m] = h[b*HIST_CH] / (hb + catSmooth);
             ++m;
@@ -407,14 +414,19 @@ kernel void find_splits(
     if (featFlags[f] == 1) {
         // Categorical: the missing bin participates as one more category.
         ushort order_[256]; float key[256];
-        int m = cat_sort(h, p.numBins, p.catSmooth, order_, key);
+        int m = cat_sort(h, p.numBins, p.catSmooth, p.minDataPerGroup, order_, key);
+        // At most maxCatThreshold categories go left, and the categorical
+        // gain carries catL2 extra regularisation (LightGBM's
+        // max_cat_threshold / cat_l2), both curbing subset overfitting.
+        int limit = min(m - 1, int(p.maxCatThreshold));
         float gl = 0.0f, hl = 0.0f;
-        for (int i = 0; i + 1 < m; ++i) {
+        for (int i = 0; i < limit; ++i) {
             uint b = order_[i];
             gl += h[b*HIST_CH]; hl += h[b*HIST_CH+1];
             float gr = G - gl, hr = H - hl;
             if (hl < p.minChildHess || hr < p.minChildHess) continue;
-            float gain = gl*gl/(hl+p.lambda) + gr*gr/(hr+p.lambda) - parentScore;
+            float lam = p.lambda + p.catL2;
+            float gain = gl*gl/(hl+lam) + gr*gr/(hr+lam) - parentScore;
             if (gain > bestGain) {
                 bestGain = gain; bestBin = uint(i + 1);
                 bgl = gl; bhl = hl; bflags = FLAG_CATEGORICAL;
@@ -487,6 +499,7 @@ struct LWParams {
     uint numLeaves; uint maxDepth; uint samplesPerGroup; uint sliceLen;
     uint numFeatures; uint numBins; uint numTiles; uint numSamples;
     float lambda; float learningRate; float minSplitGain; float catSmooth;
+    float minDataPerGroup; uint pad0; uint pad1; uint pad2;
 };
 
 struct LWOpen {
@@ -780,7 +793,7 @@ kernel void leaf_pick_apply(
     uint m8[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     if (best.flags & FLAG_CATEGORICAL) {
         ushort order_[256]; float key[256];
-        cat_sort(h, p.numBins, p.catSmooth, order_, key);
+        cat_sort(h, p.numBins, p.catSmooth, p.minDataPerGroup, order_, key);
         for (uint i2 = 0; i2 < best.bin; ++i2) {
             uint b = order_[i2];
             m8[b >> 5] |= (1u << (b & 31u));
@@ -953,7 +966,7 @@ kernel void leaf_step(
                 uint m8[8] = {0, 0, 0, 0, 0, 0, 0, 0};
                 if (best.flags & FLAG_CATEGORICAL) {
                     ushort order_[256]; float key[256];
-                    cat_sort(h, p.numBins, p.catSmooth, order_, key);
+                    cat_sort(h, p.numBins, p.catSmooth, p.minDataPerGroup, order_, key);
                     for (uint i2 = 0; i2 < best.bin; ++i2) {
                         uint b = order_[i2];
                         m8[b >> 5] |= (1u << (b & 31u));
@@ -1352,6 +1365,7 @@ struct DecideParams {
     uint levelStart; uint numLevel; uint numFeatures; uint numBins;
     uint numTiles; uint samplesPerGroup; uint isLastLevel;
     float lambda; float learningRate; float minSplitGain; float catSmooth;
+    float minDataPerGroup;
 };
 
 // GPU-side split decisions: one threadgroup per level. Phase 1 (parallel
@@ -1415,7 +1429,7 @@ kernel void decide_splits(
             float leftCount = 0.0f;
             if (best.flags & FLAG_CATEGORICAL) {
                 ushort order_[256]; float key[256];
-                cat_sort(h, p.numBins, p.catSmooth, order_, key);
+                cat_sort(h, p.numBins, p.catSmooth, p.minDataPerGroup, order_, key);
                 uint mask[8] = {0, 0, 0, 0, 0, 0, 0, 0};
                 for (uint i2 = 0; i2 < best.bin; ++i2) {
                     uint b = order_[i2];

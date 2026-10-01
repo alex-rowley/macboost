@@ -8,6 +8,13 @@ import Metal
 // column's bin bytes through a per-column random bijection directly into
 // a double-width binned matrix in GPU memory (bin edges are permutation-
 // invariant), and a fresh seed re-permutes them each round.
+//
+// Numeric features compete with the best NUMERIC shadow; categorical
+// features keep Boruta's standard bar of the best shadow overall. A
+// categorical split sorts categories by gradient mean and so has ~k
+// degrees of freedom to fit noise; a permuted high-cardinality shadow
+// reproduces that inflated null, which is a fair bar for categoricals but
+// would reject real numeric features whose null is far lower.
 
 private struct ShadowParamsHost {
     var numSamples: UInt32; var numFeatures: UInt32
@@ -24,8 +31,10 @@ public struct FeatureSelectionResult {
     /// Rounds (out of `rounds`) each feature beat the best shadow.
     public let hits: [Int]
     public let rounds: Int
-    /// Mean gain importance relative to the mean best-shadow gain; > 1
-    /// means the feature out-gained the noise ceiling on average.
+    /// Mean gain importance relative to the mean shadow ceiling the
+    /// feature was tested against (best numeric shadow for numerics, best
+    /// shadow overall for categoricals); > 1 means the feature out-gained
+    /// its noise ceiling on average.
     public let gainRatio: [Float]
 }
 
@@ -118,7 +127,8 @@ extension MacBooster {
 
         var hits = [Int](repeating: 0, count: cols)
         var gainSum = [Double](repeating: 0, count: cols)
-        var shadowSum = 0.0
+        var shadowSum = [Double](repeating: 0, count: cols)
+        let isCat = (0..<cols).map { categorical.contains($0) }
         for round in 0..<rounds {
             // Each round creates thousands of autoreleased Metal objects
             // (one command buffer per tree); drain them per round or a
@@ -149,10 +159,17 @@ extension MacBooster {
                                initModel: nil, progress: nil)
                 return sb.featureImportance(type: .gain)
             }
-            let maxShadow = gains[cols...].max() ?? 0
-            for f in 0..<cols where gains[f] > maxShadow { hits[f] += 1 }
-            for f in 0..<cols { gainSum[f] += Double(gains[f]) }
-            shadowSum += Double(maxShadow)
+            var maxNum: Float = 0, maxAll: Float = 0
+            for f in 0..<cols {
+                maxAll = max(maxAll, gains[cols + f])
+                if !isCat[f] { maxNum = max(maxNum, gains[cols + f]) }
+            }
+            for f in 0..<cols {
+                let ceiling = isCat[f] ? maxAll : maxNum
+                if gains[f] > ceiling { hits[f] += 1 }
+                gainSum[f] += Double(gains[f])
+                shadowSum[f] += Double(ceiling)
+            }
             if let progress {
                 let leading = hits.filter { $0 == round + 1 }.count
                 progress("[Selection] round \(round + 1)/\(rounds): "
@@ -174,7 +191,7 @@ extension MacBooster {
             }
         }
         let ratio = (0..<cols).map {
-            Float(gainSum[$0] / max(shadowSum, .leastNormalMagnitude))
+            Float(gainSum[$0] / max(shadowSum[$0], .leastNormalMagnitude))
         }
         progress?("[Selection] confirmed \(confirmed.count), "
                   + "tentative \(tentative.count), rejected \(rejected.count) "

@@ -98,6 +98,51 @@ final class SelectionTests: XCTestCase {
                       "NaN-riddled signal feature must still be confirmed")
     }
 
+    /// Regression (reported on 1.2.1): high-cardinality categoricals made
+    /// Boruta reject real numeric features. Permuted 254-level shadows fit
+    /// noise through the gradient-sorted subset split, winning deep splits
+    /// outright (real weak numerics got ZERO gain) and setting a ceiling no
+    /// numeric could clear. Fixed by LightGBM's categorical regularisers
+    /// (min_data_per_group / max_cat_threshold / cat_l2) plus a numeric-
+    /// only shadow ceiling for numeric features. Weak numeric signals must
+    /// survive; junk of both kinds must still be rejected.
+    func testHighCardinalityCategoricalsDoNotStarveNumerics() throws {
+        let rows = 120_000
+        var rng = SplitMix64(seed: 371)
+        var X = [Float](), y = [Float](repeating: 0, count: rows)
+        // 0-1 strong numeric, 2-3 weak numeric, 4-5 junk numeric
+        for f in 0..<6 {
+            let col = (0..<rows).map { _ in rng.uniform() }
+            let w: Float = f < 2 ? 10 : (f < 4 ? 1 : 0)
+            for i in 0..<rows { y[i] += w * col[i] }
+            X.append(contentsOf: col)
+        }
+        // 6-7 signal 254-level categoricals, 8-9 junk 254-level categoricals
+        for f in 6..<10 {
+            let effect = (0..<254).map { _ in f < 8 ? 2 * rng.uniform() - 1 : 0 }
+            let col = (0..<rows).map { _ in Float(rng.next() % 254) }
+            for i in 0..<rows { y[i] += effect[Int(col[i])] }
+            X.append(contentsOf: col)
+        }
+        for i in 0..<rows { y[i] += rng.uniform() }
+        var p = BoosterParams()
+        p.numTrees = 50; p.maxDepth = 8; p.learningRate = 0.05
+        p.subsample = 0.8; p.featureFraction = 0.8
+        p.categoricalFeatures = [6, 7, 8, 9]
+        let r = try MacBooster(params: p).selectFeatures(
+            featureMajor: X, rows: rows, cols: 10, labels: y, rounds: 12, seed: 0)
+        for f in 0..<4 {
+            XCTAssertTrue(r.confirmed.contains(f),
+                "numeric signal \(f) must be confirmed (hits \(r.hits), rejected \(r.rejected))")
+        }
+        for f in [6, 7] {
+            XCTAssertFalse(r.rejected.contains(f), "signal categorical \(f) must not be rejected")
+        }
+        for f in [4, 5, 8, 9] {
+            XCTAssertFalse(r.confirmed.contains(f), "junk feature \(f) must not be confirmed")
+        }
+    }
+
     /// Objective coverage: binary logistic and multiclass selection run
     /// end-to-end and separate signal from noise.
     func testSelectionAcrossObjectives() throws {

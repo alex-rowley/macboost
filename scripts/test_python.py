@@ -386,6 +386,24 @@ check(sum(f >= 5 for f in sel.rejected_) >= 4,
       f"noise columns rejected ({[int(f) for f in sel.rejected_]})")
 check(all(sel.gain_ratio[f] > 1.5 for f in sel.confirmed_),
       "confirmed features out-gain the shadow ceiling")
+# Regression (1.2.1): 254-level categorical shadows rejected real numerics.
+n_hc = 100_000
+Xhc = rng.random((n_hc, 4), dtype=np.float32)
+cat_cols = rng.integers(0, 254, (n_hc, 3)).astype(np.float32)
+eff = rng.normal(0, 1, 254)
+yhc = (10 * Xhc[:, 0] + 1.0 * Xhc[:, 1] + eff[cat_cols[:, 0].astype(int)]
+       + rng.random(n_hc)).astype(np.float32)
+sel_hc = MacBoostRegressor(n_estimators=50, max_depth=8, learning_rate=0.05,
+                           categorical_features=[4, 5, 6]).select_features(
+    np.column_stack([Xhc, cat_cols]), yhc, rounds=12)
+check(0 in sel_hc.confirmed_ and 1 in sel_hc.confirmed_ and 4 not in sel_hc.rejected_,
+      f"weak numeric survives 254-level categorical shadows ({sel_hc!r})")
+check(all(f not in sel_hc.confirmed_ for f in (2, 3, 5, 6)),
+      "junk numerics and junk high-card categoricals not confirmed")
+m_cat = MacBoostRegressor(n_estimators=5, categorical_features=[4], cat_l2=0.0,
+                          min_data_per_group=0, max_cat_threshold=254)
+check(m_cat.get_params()["max_cat_threshold"] == 254, "categorical regularisers are sklearn params")
+m_cat.fit(np.column_stack([Xhc, cat_cols]), yhc)
 m_sel = MacBoostRegressor(n_estimators=80, feature_selection=True).fit(Xsel, y)
 check(m_sel.selected_features_ is not None
       and all(m_sel.feature_importances_[f] == 0 for f in range(5, 10)

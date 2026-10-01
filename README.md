@@ -195,6 +195,7 @@ as aliases:
 | `num_leaves` | `num_leaves` (enables best-first growth; `max_depth` caps the path) | `max_leaves` |
 | `categorical_features` | `categorical_feature` | (dtype-based) |
 | | category ids are `float32` integers in `0..max_bin-2` (`0..254` at the default `max_bin=256`; one bin is reserved for NaN). Larger ids raise a typed error; remap first. | |
+| `cat_smooth`, `cat_l2`, `min_data_per_group`, `max_cat_threshold` | same (same defaults: 10, 10, 100, 32) | `max_cat_threshold` |
 | `subsample` | `bagging_fraction` | `subsample` |
 | `colsample_bytree` | `feature_fraction` | `colsample_bytree` |
 | `goss`, `goss_top_rate`, `goss_other_rate` | `data_sample_strategy=goss`, `top_rate`, `other_rate` | — |
@@ -311,6 +312,13 @@ sel = MacBoostRegressor().select_features(X, y, rounds=20)    # selection only
 sel.confirmed_, sel.tentative_, sel.rejected_
 ```
 
+Numeric features are scored against the best *numeric* shadow;
+categoricals against the best shadow overall. A categorical split orders
+categories by their gradient mean, so a permuted 254-level categorical
+still fits noise far better than a permuted numeric column; its shadow is
+a fair bar for other categoricals but would wrongly reject real numeric
+features.
+
 The disposable probe models default to `min(n_estimators, 100)` boosting
 rounds — Boruta needs gain-vs-shadow votes, not converged ensembles. Tune
 with `selection_estimators=` (40–50 is the cheapest sound setting).
@@ -388,7 +396,7 @@ within ±0.03 of alpha).
 
 ## Tests
 
-`swift test` runs 76 behavioural tests adapted from the LightGBM and
+`swift test` runs 77 behavioural tests adapted from the LightGBM and
 XGBoost open-source suites (upstream sources cited per test in
 `Tests/MacBoostTests/`):
 
@@ -406,7 +414,7 @@ XGBoost open-source suites (upstream sources cited per test in
   to identical predictions; `.mbds`-trained ≡ raw-trained
 - End-to-end surfaces: `scripts/test_cli.sh` (CSV/TSV/LibSVM/mbds/
   multiclass/importance flows) and `uv run scripts/test_python.py`
-  (75 checks: sklearn interop incl. real GridSearchCV/cross_val_score
+  (78 checks: sklearn interop incl. real GridSearchCV/cross_val_score
   runs, objectives, weights, multiclass with string labels, SHAP,
   guardrails, MLX/PyTorch array interop)
 
