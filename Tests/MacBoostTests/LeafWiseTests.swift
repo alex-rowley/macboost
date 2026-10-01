@@ -199,6 +199,63 @@ final class LeafWiseTests: XCTestCase {
                           1.3, "valid RMSE at noise floor")
     }
 
+    /// Regression: a low-cardinality feature on the fused (rows <= 262k)
+    /// path puts far more than samplesPerGroup rows into one bin. v1.2.0
+    /// built those histograms with samplesPerGroup = rows, overflowing the
+    /// packed hess/count word, and a single tree at lr 0.1 made RMSE
+    /// WORSE than predicting the mean. Mirrors the reported data: a
+    /// month-like 12-valued column with a skewed distribution, a 2-valued
+    /// column that is one-third NaN, constant columns, and a 13.9 target
+    /// offset.
+    func testLowCardinalityFeaturesDoNotOverflowHistograms() throws {
+        let rows = 150_000, cols = 5
+        var rng = SplitMix64(seed: 601)
+        var X = [Float](repeating: 0, count: rows * cols)
+        var y = [Float](repeating: 0, count: rows)
+        let monthEffect: [Float] = [0.30, -0.25, 0.10, 0.00, -0.15, 0.20,
+                                    0.05, -0.30, 0.25, -0.05, 0.15, -0.10]
+        for i in 0..<rows {
+            let t = rng.uniform()
+            // Skewed month distribution: ~45% of rows land in Jan–Mar.
+            let m = t < 0.45 ? Int(rng.uniform() * 3) : Int(rng.uniform() * 12)
+            let z: Float = rng.uniform() < 0.33 ? .nan : (rng.uniform() < 0.5 ? 0 : 1)
+            X[i] = Float(m + 1)
+            X[rows + i] = z
+            X[2 * rows + i] = 1                  // constant
+            X[3 * rows + i] = 0                  // constant
+            X[4 * rows + i] = rng.uniform()
+            y[i] = 13.9 + monthEffect[m] + (z == 1 ? 0.2 : 0)
+                + 0.3 * X[4 * rows + i] + 0.1 * rng.uniform()
+        }
+        let mean = y.reduce(0, +) / Float(rows)
+        let std = rmse([Float](repeating: mean, count: rows), y)
+
+        // One tree at lr 0.1 can only shrink the residual.
+        var p1 = BoosterParams()
+        p1.numTrees = 1; p1.maxDepth = 10; p1.numLeaves = 31
+        let one = try MacBooster(params: p1)
+        try one.fit(featureMajor: X, rows: rows, cols: cols, labels: y)
+        let pred1 = one.predict(featureMajor: X, rows: rows, cols: cols)
+        XCTAssertLessThan(rmse(pred1, y), std,
+            "one leaf-wise tree must not increase RMSE above std \(std)")
+        XCTAssertEqual(pred1.reduce(0, +) / Float(rows), mean, accuracy: 0.01,
+            "one tree must keep the prediction mean at the target mean")
+
+        // Full fit must land at the noise floor, like level-wise does.
+        var pLevel = BoosterParams(); pLevel.numTrees = 100; pLevel.maxDepth = 5
+        let level = try MacBooster(params: pLevel)
+        try level.fit(featureMajor: X, rows: rows, cols: cols, labels: y)
+        var pLeaf = BoosterParams()
+        pLeaf.numTrees = 100; pLeaf.maxDepth = 10; pLeaf.numLeaves = 31
+        let leaf = try MacBooster(params: pLeaf)
+        try leaf.fit(featureMajor: X, rows: rows, cols: cols, labels: y)
+        let rLevel = rmse(level.predict(featureMajor: X, rows: rows, cols: cols), y)
+        let rLeaf = rmse(leaf.predict(featureMajor: X, rows: rows, cols: cols), y)
+        XCTAssertLessThan(rLeaf, rLevel * 1.05,
+            "leaf-wise (\(rLeaf)) must match level-wise (\(rLevel)) on low-cardinality data")
+        XCTAssertLessThan(rLeaf, 0.06, "noise floor is ~0.03 (uniform noise of width 0.1)")
+    }
+
     /// Rows above the single-threadgroup threshold exercise the
     /// multi-dispatch split pipeline (partition_count/scan/scatter,
     /// zero_slot) instead of the fused leaf_step path.
