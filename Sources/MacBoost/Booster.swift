@@ -954,15 +954,22 @@ public final class MacBooster {
         // buffer with no host round-trips and no indirect dispatches. Tree
         // structures come back through the same pipelined readback as
         // level-wise.
-        let lwSpgEarly = rows <= 262_144 ? rows : samplesPerGroup
+        // samplesPerGroup bounds the rows ONE threadgroup accumulates into
+        // its packed (hess << 13 | count) histogram word — it must stay at
+        // the global 4096 even on the fused (rows <= 262k) path. An earlier
+        // version set it to `rows` there so every segment was one build
+        // group; any bin holding > 4096 rows (a low-cardinality feature on
+        // a few hundred thousand rows) then overflowed hess into count and
+        // leaf values diverged. The fused leaf_step zeroes the child slot
+        // itself when a segment spans several build groups.
+        let lwSpg = samplesPerGroup
         let lwParams = LWParamsHost(
             numLeaves: UInt32(numLeaves), maxDepth: UInt32(maxDepth),
-            samplesPerGroup: UInt32(lwSpgEarly), sliceLen: UInt32(sliceLen),
+            samplesPerGroup: UInt32(lwSpg), sliceLen: UInt32(sliceLen),
             numFeatures: UInt32(cols), numBins: UInt32(nBins),
             numTiles: UInt32(numTiles), numSamples: UInt32(rows),
             lambda: lambda, learningRate: lr,
             minSplitGain: params.minSplitGain, catSmooth: params.catSmooth)
-        let lwSpg = lwSpgEarly
         let maxSegGroups = (rows + lwSpg - 1) / lwSpg
         func growLeafWiseTree(t: Int, classIdx: Int) throws {
             gossActive = params.goss && t >= gossWarmup

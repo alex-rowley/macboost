@@ -144,7 +144,7 @@ y = df["loss"].to_numpy("float32")
 model = MacBoostRegressor(
     n_estimators=500, max_depth=6, learning_rate=0.05,
     objective="tweedie", tweedie_variance_power=1.5,   # or l2/mae/huber/quantile/poisson
-    categorical_features=[3, 7],                        # columns holding integer ids
+    categorical_features=[3, 7],                        # integer ids 0..max_bin-2 (0..254)
     monotone_constraints=[0, 1, 0, 0, -1, 0, 0, 0],
     subsample=0.8, colsample_bytree=0.8,
 )
@@ -194,6 +194,7 @@ as aliases:
 | `max_bin` | `max_bin` (macboost's count includes the reserved missing bin) | `max_bin` |
 | `num_leaves` | `num_leaves` (enables best-first growth; `max_depth` caps the path) | `max_leaves` |
 | `categorical_features` | `categorical_feature` | (dtype-based) |
+| | category ids are `float32` integers in `0..max_bin-2` (`0..254` at the default `max_bin=256`; one bin is reserved for NaN). Larger ids raise a typed error; remap first. | |
 | `subsample` | `bagging_fraction` | `subsample` |
 | `colsample_bytree` | `feature_fraction` | `colsample_bytree` |
 | `goss`, `goss_top_rate`, `goss_other_rate` | `data_sample_strategy=goss`, `top_rate`, `other_rate` | — |
@@ -387,7 +388,7 @@ within ±0.03 of alpha).
 
 ## Tests
 
-`swift test` runs 75 behavioural tests adapted from the LightGBM and
+`swift test` runs 76 behavioural tests adapted from the LightGBM and
 XGBoost open-source suites (upstream sources cited per test in
 `Tests/MacBoostTests/`):
 
@@ -405,7 +406,7 @@ XGBoost open-source suites (upstream sources cited per test in
   to identical predictions; `.mbds`-trained ≡ raw-trained
 - End-to-end surfaces: `scripts/test_cli.sh` (CSV/TSV/LibSVM/mbds/
   multiclass/importance flows) and `uv run scripts/test_python.py`
-  (74 checks: sklearn interop incl. real GridSearchCV/cross_val_score
+  (75 checks: sklearn interop incl. real GridSearchCV/cross_val_score
   runs, objectives, weights, multiclass with string labels, SHAP,
   guardrails, MLX/PyTorch array interop)
 

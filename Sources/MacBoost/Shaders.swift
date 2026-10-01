@@ -879,7 +879,7 @@ kernel void leaf_pick_apply(
 kernel void leaf_step(
     device LWOpen  *open        [[buffer(0)]],
     device LWState *state       [[buffer(1)]],
-    device const float *hist    [[buffer(2)]],
+    device float   *hist        [[buffer(2)]],
     device NodeSplit *splits    [[buffer(3)]],
     device float   *leafValues  [[buffer(4)]],
     device uint    *catMask     [[buffer(5)]],
@@ -1049,8 +1049,17 @@ kernel void leaf_step(
     }
     threadgroup_barrier(mem_flags::mem_device);
 
-    // --- single-group stable partition of the split segment ---
     if (!spec->active) return;
+    // The smaller child's slot is accumulated into by several build
+    // groups when it exceeds samplesPerGroup (build_histograms only
+    // writes densely for single-group nodes), so it must start zeroed.
+    // Slots are reused across trees; nothing else clears them.
+    if (spec->needsZero) {
+        device float *dst = hist + (ulong)spec->childSlot * p.sliceLen;
+        for (uint j = tid; j < p.sliceLen; j += TG_SIZE) dst[j] = 0.0f;
+    }
+
+    // --- single-group stable partition of the split segment ---
     uint segStart = spec->segStart, n = spec->segCount;
     uint per = (n + TG_SIZE - 1) / TG_SIZE;
     uint cStart = min(tid * per, n);

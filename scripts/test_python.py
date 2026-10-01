@@ -359,6 +359,22 @@ except MacBoostError as e:
 lw_clf = MacBoostClassifier(n_estimators=40, max_depth=8, num_leaves=31).fit(Xb, yb)
 lw_acc = float(np.mean(lw_clf.predict(Xb) == yb))
 check(lw_acc > 0.79, f"leaf-wise classifier accuracy {lw_acc:.3f}")
+# Regression (1.2.0): low-cardinality features on >4096-rows-per-bin
+# segments overflowed the packed histogram word on the fused leaf-wise
+# path; one tree at lr 0.1 made RMSE WORSE than the target's std.
+n_lc = 120_000
+month = rng.integers(1, 13, n_lc).astype(np.float32)
+month[: n_lc // 3] = rng.integers(1, 4, n_lc // 3)          # skewed
+zoning = np.where(rng.random(n_lc) < 0.33, np.nan,
+                  rng.integers(0, 2, n_lc)).astype(np.float32)
+Xlc = np.column_stack([month, zoning, np.ones(n_lc, np.float32),
+                       rng.random(n_lc, dtype=np.float32)])
+ylc = (13.9 + 0.3 * np.sin(month) + np.nan_to_num(zoning) * 0.2
+       + 0.3 * Xlc[:, 3] + 0.1 * rng.random(n_lc)).astype(np.float32)
+p_lc = MacBoostRegressor(n_estimators=1, max_depth=10, num_leaves=31).fit(Xlc, ylc).predict(Xlc)
+r_lc = float(np.sqrt(np.mean((p_lc - ylc) ** 2)))
+check(r_lc < float(ylc.std()) and abs(float(p_lc.mean()) - float(ylc.mean())) < 0.01,
+      f"leaf-wise tree on low-cardinality features shrinks RMSE ({r_lc:.4f} < std {ylc.std():.4f})")
 
 print("boruta feature selection (GPU-resident shadows)")
 Xsel = np.column_stack([X[:, :5], rng.random((len(X), 5), dtype=np.float32)])
