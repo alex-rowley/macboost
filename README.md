@@ -34,6 +34,9 @@ classification on dense data:**
   bounds-propagated guarantees, gain/split feature importance, GPU
   TreeSHAP contributions (incl. multiclass; ~50M row·trees/s — 200k rows
   × 100 trees explained in 0.4s), calibrated L1/quantile leaves
+- **Calibration folded into the model**: Platt, temperature and prior-shift
+  corrections become leaf and base-score edits, so the calibrated model is
+  an ordinary model file — no wrapper to ship
 - **Feature selection**: built-in Boruta (shadow features) — see below;
   no other GBM library ships this natively
 - **Workflow**: early stopping with per-iteration GPU validation eval,
@@ -115,7 +118,7 @@ from source.
 **Swift** — add the package to your `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/alex-rowley/macboost", from: "0.1.0")
+.package(url: "https://github.com/alex-rowley/macboost", from: "1.5.0")
 ```
 
 **From source** (needs Xcode command-line tools; kernels compile at
@@ -125,7 +128,7 @@ dependencies):
 ```sh
 git clone https://github.com/alex-rowley/macboost && cd macboost
 swift build -c release        # library, CLI (.build/release/macboost), dylib
-swift test                    # 75 behavioural tests
+swift test                    # 79 behavioural tests
 ./scripts/build_wheel.sh && pip install python/dist/*.whl
 ```
 
@@ -156,6 +159,10 @@ model.feature_importances_                       # gain-based; .feature_importan
 model.predict_contrib(X_test)                    # TreeSHAP, rows sum to prediction
 model.save_model("model.json")
 ```
+
+A classifier trained on resampled data gets its probabilities corrected
+in place with `model.calibrate(X_holdout, y_holdout)` — see
+[Calibration](#calibration).
 
 `MacBoostClassifier` handles binary and multiclass automatically (labels
 encoded like sklearn — strings work), with `predict_proba`,
@@ -303,6 +310,42 @@ splits; prefer the XGBoost export for models with many-level categoricals.
 The graph outputs what `predict` returns: probabilities for classifiers,
 means for poisson/tweedie, raw scores for regression.
 
+## Calibration
+
+The usual reason to calibrate a classifier is that it was trained on a
+resampled set: positives oversampled, negatives dropped, or
+`scale_pos_weight` applied, so its probabilities sit at the training
+prevalence rather than the population's. Platt scaling fits
+`p = sigmoid(A·margin + B)` on held-out rows, and because the margin is
+`base + Σ leaves`, that map folds into the model exactly: every leaf is
+multiplied by `A` and the base score becomes `A·base + B`. The calibrated
+model is the same file, the same estimator, exports the same way, and
+`predict_contrib` stays consistent (contributions scale by `A`, `B` lands
+in the expected-value column).
+
+```python
+model = MacBoostClassifier(n_estimators=500).fit(X_resampled, y_resampled)
+
+fit = model.calibrate(X_holdout, y_holdout)      # held-out rows at the real base rate
+# {'method': 'platt', 'A': 0.95, 'B': -1.66}; predict_proba is now population-scale
+
+model.fold(A, B)                                  # apply coefficients fitted elsewhere
+model.fold(1.0, logit(pop_rate) - logit(train_rate))   # pure prior shift, no fitting needed
+model.fold_temperature(T)                         # multiclass: margin / T
+model.calibration_                                # {'scale', 'offset', 'folds'}, composed
+```
+
+`fold(A, B)` is the primitive: `A > 0` scales every leaf, `B` is a scalar
+or one offset per class, and repeated folds compose. It works on any
+objective (it is an affine map on the margin) and on models loaded
+without the Metal core. `calibrate` fits Platt for binary and temperature
+scaling for multiclass on the rows you pass, which must not be the
+training rows. For cross-validated pipelines, fit `A` and `B` on pooled
+out-of-fold margins yourself and call `fold` on the all-rows model. The
+composed fold is stored in the model JSON under `calibration`, so a file
+states whether and how it was calibrated. Isotonic regression is not
+affine and cannot be folded; keep it as a wrapper if you need it.
+
 ## Feature selection (Boruta, GPU-resident)
 
 Everyone benchmarks feature importance against random probes eventually;
@@ -407,7 +450,7 @@ within ±0.03 of alpha).
 
 ## Tests
 
-`swift test` runs 77 behavioural tests adapted from the LightGBM and
+`swift test` runs 79 behavioural tests adapted from the LightGBM and
 XGBoost open-source suites (upstream sources cited per test in
 `Tests/MacBoostTests/`):
 
@@ -422,12 +465,13 @@ XGBoost open-source suites (upstream sources cited per test in
   the prediction; GOSS warm-up is exactly full training; tiny-subsample
   degradation proves sampling actually engages
 - **Bit-exactness**: GPU inference ≡ CPU inference; save/load round-trips
-  to identical predictions; `.mbds`-trained ≡ raw-trained
+  to identical predictions; `.mbds`-trained ≡ raw-trained; a calibration
+  fold is an exact affine map on the margin that composes and round-trips
 - End-to-end surfaces: `scripts/test_cli.sh` (CSV/TSV/LibSVM/mbds/
   multiclass/importance flows) and `uv run scripts/test_python.py`
-  (81 checks: sklearn interop incl. real GridSearchCV/cross_val_score
+  (97 checks: sklearn interop incl. real GridSearchCV/cross_val_score
   runs, objectives, weights, multiclass with string labels, SHAP,
-  guardrails, MLX/PyTorch array interop)
+  guardrails, calibration folds, MLX/PyTorch array interop)
 
 These tests caught real bugs during development — a double-applied
 learning rate under bagging, a monotonicity leak from crossed bounds in

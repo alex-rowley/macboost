@@ -493,6 +493,75 @@ est_sel = MacBoostRegressor(feature_selection=True, selection_rounds=7,
 check(_clone(est_sel).get_params() == est_sel.get_params(),
       "selection params round-trip through sklearn clone")
 
+print("calibration folds")
+# Train at 50/50 on a ~16%-positive population; Platt on held-out population
+# rows must recover the prior shift and fold into the trees.
+def _pop(n):
+    Xp = rng.random((n, 6), dtype=np.float32)
+    lg = 4 * Xp[:, 0] - 3 * Xp[:, 1] + 2 * (Xp[:, 2] > 0.5) - 4.0
+    return Xp, (rng.random(n) < 1 / (1 + np.exp(-lg))).astype(np.float32)
+Xpop, ypop = _pop(200_000)
+_pos, _neg = np.where(ypop == 1)[0], np.where(ypop == 0)[0]
+_tr = np.concatenate([_pos[:12000], _neg[:12000]]); rng.shuffle(_tr)
+Xcal, ycal = _pop(40_000)
+Xte, yte = _pop(40_000)
+cal = MacBoostClassifier(n_estimators=120, max_depth=4).fit(Xpop[_tr], ypop[_tr])
+check(cal.calibration_ is None, "calibration_ is None before any fold")
+p_before = cal.predict_proba(Xte)[:, 1]
+fit = cal.calibrate(Xcal, ycal)
+p_after = cal.predict_proba(Xte)[:, 1]
+shift = float(np.log(ypop.mean() / (1 - ypop.mean())))
+check(fit["method"] == "platt" and abs(fit["B"] - shift) < 0.25 and 0.8 < fit["A"] < 1.1,
+      f"Platt recovers the prior shift (A={fit['A']:.3f}, B={fit['B']:.3f}, shift={shift:.3f})")
+check(abs(p_before.mean() - yte.mean()) > 0.1 and abs(p_after.mean() - yte.mean()) < 0.01,
+      f"calibrated mean probability {p_after.mean():.4f} matches population rate {yte.mean():.4f}")
+c = cal.calibration_
+check(c["folds"] == 1 and abs(c["scale"] - fit["A"]) < 1e-5 and abs(c["offset"][0] - fit["B"]) < 1e-5,
+      "calibration_ reports the applied fold")
+cal.fold(1.0, 0.0)
+check(cal.calibration_["folds"] == 2, "folds compose and count")
+with _tf.TemporaryDirectory() as _tmp:
+    cal.save_model(f"{_tmp}/cal.json")
+    cal2 = MacBoostClassifier.load_model(f"{_tmp}/cal.json")
+    check(cal2.calibration_ == cal.calibration_
+          and np.array_equal(cal2.predict_proba(Xte[:2000]), cal.predict_proba(Xte[:2000])),
+          "calibration survives save/load")
+    from macboost._pyinfer import PyModel
+    pym = PyModel(f"{_tmp}/cal.json")
+    check(np.abs(pym.predict_raw(Xte[:2000]) - cal._raw_predict(Xte[:2000])).max() < 1e-4,
+          "pure-Python predictor scores the folded model unchanged")
+    base = MacBoostClassifier(n_estimators=20, max_depth=3).fit(Xpop[_tr][:4000], ypop[_tr][:4000])
+    base.save_model(f"{_tmp}/base.json")
+    pyb = PyModel(f"{_tmp}/base.json"); pyb.fold(0.7, [-1.3]); base.fold(0.7, -1.3)
+    check(np.abs(pyb.predict_raw(Xte[:500]) - base._raw_predict(Xte[:500])).max() < 1e-4
+          and pyb.calibration["folds"] == 1,
+          "PyModel.fold matches the native fold")
+    cal.save_xgboost(f"{_tmp}/cal.xgb.json")
+    _bx = _xgb.Booster(); _bx.load_model(f"{_tmp}/cal.xgb.json")
+    check(np.abs(_bx.predict(_xgb.DMatrix(Xte[:2000])) - p_after[:2000]).max() < 1e-5,
+          "XGBoost export of a folded model is calibrated")
+for bad in ((0.0, 0.0), (-1.0, 0.0), (float("nan"), 0.0), (1.0, float("inf"))):
+    try:
+        cal.fold(*bad); ok = False
+    except ValueError:
+        ok = True
+    check(ok, f"fold rejects A,B={bad}")
+# Multiclass temperature: lower held-out log loss, same argmax.
+_X3 = rng.random((45_000, 4), dtype=np.float32)
+_y3 = np.clip((_X3[:, 0] * 3 + 0.3 * rng.standard_normal(45_000)).astype(int), 0, 2)
+mct = MacBoostClassifier(n_estimators=200, max_depth=6, learning_rate=0.3).fit(_X3[:20000], _y3[:20000])
+def _nll(P, yy): return float(-np.mean(np.log(P[np.arange(len(yy)), yy])))
+P0 = mct.predict_proba(_X3[35000:])
+fit3 = mct.calibrate(_X3[20000:35000], _y3[20000:35000])
+P1 = mct.predict_proba(_X3[35000:])
+check(fit3["method"] == "temperature" and fit3["T"] > 1.0
+      and _nll(P1, _y3[35000:]) < _nll(P0, _y3[35000:]) and (P0.argmax(1) == P1.argmax(1)).all(),
+      f"temperature scaling T={fit3['T']:.3f} lowers held-out log loss, argmax unchanged")
+check(len(mct.calibration_["offset"]) == 3, "multiclass calibration_ has per-class offsets")
+reg_f = MacBoostRegressor(n_estimators=10).fit(_X3[:4000], _X3[:4000, 0])
+_b4 = reg_f.predict(_X3[:200]); reg_f.fold(2.0, 1.0)
+check(np.abs(reg_f.predict(_X3[:200]) - (2 * _b4 + 1)).max() < 1e-4, "fold is an affine map for regressors too")
+
 print("tier 1+2 features")
 # Multiclass with arbitrary label values (auto-encoded).
 Xm3 = rng.random((8_000, 4), dtype=np.float32)

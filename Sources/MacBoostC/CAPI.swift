@@ -275,6 +275,37 @@ public func macboost_load(
     }
 }
 
+@_cdecl("macboost_fold")
+public func macboost_fold(
+    _ handle: UnsafeMutableRawPointer?, _ scale: Float,
+    _ offset: UnsafePointer<Float>?, _ count: Int64,
+    _ err: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let handle, let offset, count > 0 else { setError(err, "null argument"); return -1 }
+    do {
+        try booster(handle).fold(scale: scale,
+                                 offset: Array(UnsafeBufferPointer(start: offset, count: Int(count))))
+        return 0
+    } catch {
+        setError(err, "\(error)")
+        return -1
+    }
+}
+
+/// Writes the composed calibration (scale, offsets) and returns the number of
+/// folds applied; 0 means uncalibrated and nothing is written.
+@_cdecl("macboost_calibration")
+public func macboost_calibration(
+    _ handle: UnsafeMutableRawPointer?, _ scale: UnsafeMutablePointer<Float>?,
+    _ offset: UnsafeMutablePointer<Float>?, _ capacity: Int64
+) -> Int64 {
+    guard let handle, let scale, let offset, let c = booster(handle).calibration else { return 0 }
+    guard c.offset.count <= Int(capacity) else { return -1 }
+    scale.pointee = c.scale
+    for (i, v) in c.offset.enumerated() { offset[i] = v }
+    return Int64(c.folds)
+}
+
 @_cdecl("macboost_num_trees")
 public func macboost_num_trees(_ handle: UnsafeMutableRawPointer?) -> Int64 {
     guard let handle else { return -1 }

@@ -152,6 +152,30 @@ class PyModel:
             out = np.exp(out)
         return out
 
+    def fold(self, scale, offset):
+        k = self.num_classes
+        off = np.broadcast_to(np.asarray(offset, dtype=np.float32).ravel(), (k,)).copy()
+        for i, tree in enumerate(self.trees):
+            tree["leaf"] = (tree["leaf"] * np.float32(scale)).astype(np.float32)
+            self._raw["trees"][i]["leaf"] = tree["leaf"].tolist()
+        self.base_scores = (np.float32(scale) * self.base_scores + off).astype(np.float32)
+        self.base_score = self.base_scores[0] if k == 1 else np.float32(scale) * self.base_score
+        self._raw["baseScores"] = self.base_scores.tolist()
+        self._raw["baseScore"] = float(self.base_score)
+        c = self._raw.get("calibration")
+        if c:
+            c = {"scale": c["scale"] * scale,
+                 "offset": (scale * np.asarray(c["offset"]) + off).tolist(),
+                 "folds": c["folds"] + 1}
+        else:
+            c = {"scale": float(scale), "offset": off.tolist(), "folds": 1}
+        self._raw["calibration"] = c
+        self._packed = None
+
+    @property
+    def calibration(self):
+        return self._raw.get("calibration")
+
     def feature_importance(self, importance_type="gain"):
         imp = np.zeros(self.num_features, dtype=np.float32)
         for tree in self.trees:

@@ -83,6 +83,12 @@ def _configure(_lib):
     _lib.macboost_save.argtypes = [ctypes.c_void_p, ctypes.c_char_p, _c_char_pp]
     _lib.macboost_load.restype = ctypes.c_void_p
     _lib.macboost_load.argtypes = [ctypes.c_char_p, _c_char_pp]
+    _lib.macboost_fold.restype = ctypes.c_int32
+    _lib.macboost_fold.argtypes = [ctypes.c_void_p, ctypes.c_float, _f32_p,
+                                   ctypes.c_int64, _c_char_pp]
+    _lib.macboost_calibration.restype = ctypes.c_int64
+    _lib.macboost_calibration.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float),
+                                          _f32_p, ctypes.c_int64]
     for name in ("macboost_num_trees", "macboost_num_features", "macboost_best_iteration",
                  "macboost_num_classes"):
         fn = getattr(_lib, name)
@@ -273,3 +279,22 @@ def num_features(handle: _Handle) -> int:
 
 def best_iteration(handle: _Handle) -> int:
     return _lib.macboost_best_iteration(handle.ptr)
+
+
+def fold(handle: _Handle, scale: float, offset: np.ndarray) -> None:
+    off = np.ascontiguousarray(offset, dtype=np.float32).ravel()
+    err = ctypes.c_char_p()
+    if _lib.macboost_fold(handle.ptr, float(scale), _f32(off), off.size,
+                          ctypes.byref(err)) != 0:
+        raise MacBoostError(_take_error(err))
+
+
+def calibration(handle: _Handle) -> dict | None:
+    k = max(1, _lib.macboost_num_classes(handle.ptr))
+    scale = ctypes.c_float()
+    off = np.zeros(k, dtype=np.float32)
+    folds = _lib.macboost_calibration(handle.ptr, ctypes.byref(scale), _f32(off), k)
+    if folds <= 0:
+        return None
+    return {"scale": float(scale.value), "offset": off.astype(np.float64).tolist(),
+            "folds": int(folds)}

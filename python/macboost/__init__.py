@@ -13,6 +13,10 @@ share; the well-known native spellings (num_iterations, eta, gamma,
 lambda_l2, ...) are accepted as aliases. get_params/set_params implement the
 scikit-learn estimator protocol, so clone, Pipeline, GridSearchCV and
 cross_val_score work.
+
+Calibration folds into the trees: model.fold(A, B) applies margin' = A*margin
++ B in place (Platt, temperature, prior shift), and classifier.calibrate(X, y)
+fits it on held-out rows. The result is an ordinary model file.
 """
 
 import numpy as np
@@ -362,6 +366,33 @@ class _BaseBooster:
         return _interop.wrapper_for(X)(
             _core.predict_contrib(self._handle, _interop.to_numpy(X)))
 
+    def fold(self, A, B=0.0):
+        """Fold margin' = A*margin + B into the trees in place. B is a scalar
+        or one value per class. Exact for Platt (A, B), temperature (1/T, 0)
+        and prior shift (1, logit(target_rate) - logit(train_rate))."""
+        A = float(A)
+        if not (np.isfinite(A) and A > 0):
+            raise ValueError("A must be finite and > 0")
+        B = np.asarray(B, dtype=np.float64).ravel()
+        if B.size == 0 or not np.all(np.isfinite(B)):
+            raise ValueError("B must be finite")
+        if getattr(self, "_pymodel", None) is not None:
+            self._pymodel.fold(A, B)
+        elif self._handle is None:
+            raise MacBoostError("model is not fitted")
+        else:
+            _core.fold(self._handle, A, B)
+        return self
+
+    @property
+    def calibration_(self):
+        """Composed fold applied so far ({scale, offset, folds}) or None."""
+        if getattr(self, "_pymodel", None) is not None:
+            return self._pymodel.calibration
+        if self._handle is None:
+            return None
+        return _core.calibration(self._handle)
+
     def save_xgboost(self, path):
         """Export as an XGBoost JSON model (xgboost >= 1.6) for deployment
         anywhere xgboost runs: identical predictions, native categorical
@@ -470,6 +501,30 @@ class MacBoostClassifier(_SkClassifier, _BaseBooster, _SkBase):
         classes = self.classes_ if self.classes_ is not None else np.array([0, 1])
         out = classes[idx]
         return _interop.wrapper_for(X)(out) if out.dtype.kind in "biuf" else out
+
+    def fold_temperature(self, T):
+        """Fold temperature scaling (margin / T) into the trees."""
+        T = float(T)
+        if not (np.isfinite(T) and T > 0):
+            raise ValueError("T must be finite and > 0")
+        return self.fold(1.0 / T, 0.0)
+
+    def calibrate(self, X, y):
+        """Fit a calibration on held-out rows (not the training rows) and
+        fold it in. Binary: Platt scaling, returns {"method": "platt", "A",
+        "B"}. Multiclass: temperature scaling, returns {"method":
+        "temperature", "T"}. Use fold() directly to apply coefficients
+        fitted elsewhere, e.g. on pooled out-of-fold margins."""
+        from . import calibration as _cal
+        raw = np.asarray(self._raw_predict(X), dtype=np.float64)
+        y = self._transform_labels(_interop.to_numpy(y))
+        if raw.ndim == 1:
+            A, B = _cal.fit_platt(raw, y)
+            self.fold(A, B)
+            return {"method": "platt", "A": A, "B": B}
+        T = _cal.fit_temperature(raw, y)
+        self.fold_temperature(T)
+        return {"method": "temperature", "T": T}
 
     def score(self, X, y):
         """Accuracy, per the scikit-learn classifier contract."""

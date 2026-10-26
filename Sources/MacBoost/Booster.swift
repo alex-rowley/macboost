@@ -118,6 +118,15 @@ public struct FitTimings {
     public var total = 0.0
 }
 
+/// Affine calibration folded into the model: margin' = scale·margin + offset[k].
+/// Composed across repeated folds, so it always maps raw training margins
+/// to the current ones.
+public struct Calibration: Codable, Equatable {
+    public var scale: Float
+    public var offset: [Float]
+    public var folds: Int
+}
+
 /// A trained tree in implicit-heap layout. feature[n] < 0 marks a leaf.
 /// flags bit0: missing values go left; bit1: categorical split (membership
 /// of the sample's bin in catMask decides left). catMask holds 8 UInt32
@@ -260,6 +269,7 @@ public final class MacBooster {
     private var trainedCategorical: Set<Int>
     /// Per-class base scores (single-element for non-multiclass).
     public private(set) var baseScores: [Float] = [0]
+    public private(set) var calibration: Calibration?
     /// Number of classes the model was trained with (1 unless multiclass).
     public internal(set) var trainedNumClasses = 1
 
@@ -2030,6 +2040,35 @@ public final class MacBooster {
     /// NaN routes by the learned default direction; unseen/out-of-range
     /// categories route like missing. Large batches run on the GPU
     /// (bit-identical to the CPU path); small ones on the CPU.
+    /// Fold margin' = scale·margin + offset into the leaves and base scores.
+    /// `offset` has one value, or one per class for multiclass. Exact for
+    /// Platt scaling (A, B), temperature scaling (1/T, 0) and prior shift
+    /// (1, logit(target rate) − logit(training rate)).
+    public func fold(scale: Float, offset: [Float]) throws {
+        guard scale > 0, scale.isFinite else {
+            throw MacBoostError.invalidInput("fold scale must be finite and > 0")
+        }
+        let K = trainedNumClasses
+        guard offset.count == 1 || offset.count == K, offset.allSatisfy({ $0.isFinite }) else {
+            throw MacBoostError.invalidInput("fold offset needs 1 or \(K) finite values")
+        }
+        let off = offset.count == K ? offset : [Float](repeating: offset[0], count: K)
+        for t in trees.indices {
+            for n in trees[t].leaf.indices { trees[t].leaf[n] *= scale }
+        }
+        for k in 0..<K { baseScores[k] = scale * baseScores[k] + off[k] }
+        baseScore = K == 1 ? baseScores[0] : scale * baseScore
+        if var c = calibration {
+            c.scale *= scale
+            c.offset = zip(c.offset, off).map { scale * $0 + $1 }
+            c.folds += 1
+            calibration = c
+        } else {
+            calibration = Calibration(scale: scale, offset: off, folds: 1)
+        }
+        forestCache = nil
+    }
+
     public func predict(featureMajor X: [Float], rows: Int, cols: Int) -> [Float] {
         var out = predictRawScores(featureMajor: X, rows: rows, cols: cols)
         if params.objective.usesLogLink {
@@ -2167,6 +2206,7 @@ public final class MacBooster {
         var trees: [Tree]
         var numClasses: Int?
         var baseScores: [Float]?
+        var calibration: Calibration?
     }
 
     public func save(to url: URL) throws {
@@ -2177,7 +2217,8 @@ public final class MacBooster {
                           featureNames: featureNames,
                           trees: trees,
                           numClasses: trainedNumClasses,
-                          baseScores: baseScores)
+                          baseScores: baseScores,
+                          calibration: calibration)
         try JSONEncoder().encode(m).write(to: url)
     }
 
@@ -2198,6 +2239,7 @@ public final class MacBooster {
         b.featureNames = m.featureNames
         b.trainedNumClasses = m.numClasses ?? 1
         b.baseScores = m.baseScores ?? [m.baseScore]
+        b.calibration = m.calibration
         return b
     }
 }
