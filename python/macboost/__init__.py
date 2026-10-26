@@ -36,7 +36,7 @@ except ImportError:
     class _SkClassifier: pass
 
 __all__ = ["MacBoostRegressor", "MacBoostClassifier", "MacBoostError"]
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 # Native LightGBM / XGBoost spellings -> canonical macboost names.
 _ALIASES = {
