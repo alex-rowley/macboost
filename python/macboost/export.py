@@ -39,16 +39,19 @@ def _model_dict(model):
 
 
 class _Node:
-    __slots__ = ("feature", "threshold", "default_left", "left", "right", "value")
+    __slots__ = ("feature", "threshold", "default_left", "left", "right",
+                 "value", "cover", "gain")
 
     def __init__(self, feature=-1, threshold=0.0, default_left=False,
-                 left=-1, right=-1, value=0.0):
+                 left=-1, right=-1, value=0.0, cover=1.0, gain=0.0):
         self.feature = feature          # -1 => leaf
         self.threshold = threshold      # "x <= threshold" goes left
         self.default_left = default_left
         self.left = left
         self.right = right
         self.value = value
+        self.cover = cover              # training rows routed through the node
+        self.gain = gain                # split gain (0 at leaves)
 
 
 def _explicit_tree(tree, num_bins):
@@ -59,6 +62,9 @@ def _explicit_tree(tree, num_bins):
     leaf = tree["leaf"]
     flags = tree["flags"]
     cat_mask = tree.get("catMask") or []
+    cover = tree.get("cover") or []       # absent in very old models
+    gain = tree.get("gain") or []
+    has_stats = len(cover) == len(feature) and len(cover) > 0 and cover[0] > 0
     data_bins = num_bins - 1
     nodes = []
 
@@ -70,16 +76,25 @@ def _explicit_tree(tree, num_bins):
         word = cat_mask[heap_idx * 8 + (cat >> 5)]
         return (word >> (cat & 31)) & 1 == 1
 
-    def build(h):
+    def stats(h):
+        if not has_stats:
+            return 1.0, 0.0
+        return float(cover[h]), (float(gain[h]) if h < len(gain) else 0.0)
+
+    def build(h, scale=1.0):
+        # scale < 1 for duplicated subtrees under a categorical chain.
         f = int(feature[h])
+        cv, gn = stats(h)
+        cv *= scale
         if f < 0:
-            return add(_Node(value=float(leaf[h])))
+            return add(_Node(value=float(leaf[h]), cover=cv))
         fl = int(flags[h])
         if fl & _FLAG_CATEGORICAL == 0:
             n = add(_Node(feature=f, threshold=float(threshold[h]),
-                          default_left=bool(fl & _FLAG_DEFAULT_LEFT)))
-            nodes[n].left = build(2 * h + 1)
-            nodes[n].right = build(2 * h + 2)
+                          default_left=bool(fl & _FLAG_DEFAULT_LEFT),
+                          cover=cv, gain=gn))
+            nodes[n].left = build(2 * h + 1, scale)
+            nodes[n].right = build(2 * h + 2, scale)
             return n
 
         # Categorical: membership of ints 0..data_bins-1 (missing bin =
@@ -88,27 +103,45 @@ def _explicit_tree(tree, num_bins):
         # out-of-range categories route to the missing bin's side.
         sides = [member(h, c) for c in range(data_bins)]     # True => left
         missing_left = member(h, data_bins)
-        runs = []                                            # (end_cat, side)
+        runs = []                                     # (end_cat, side, size)
         for c in range(data_bins):
             if runs and runs[-1][1] == sides[c]:
-                runs[-1] = (c, sides[c])
+                runs[-1] = (c, sides[c], runs[-1][2] + 1)
             else:
-                runs.append((c, sides[c]))
+                runs.append((c, sides[c], 1))
 
-        def side_subtree(left_side):
-            return build(2 * h + 1) if left_side else build(2 * h + 2)
+        # Per-category counts aren't stored: share each side's cover over
+        # its runs by category count (missing bin = one category, split
+        # across the two guards) and scale duplicated subtrees to match.
+        n_cats = {True: 1 if missing_left else 0, False: 0 if missing_left else 1}
+        for c in range(data_bins):
+            n_cats[sides[c]] += 1
+        child_of = {True: 2 * h + 1, False: 2 * h + 2}
+        child_cover = {side: stats(child_of[side])[0] * scale
+                       for side in (True, False)}
+
+        def share(side, k):
+            return child_cover[side] * k / n_cats[side]
+
+        def side_subtree(side, k):
+            sub_scale = scale * k / n_cats[side] if has_stats else scale
+            return build(child_of[side], sub_scale)
 
         # Trailing destination for x > last category: missing side.
-        chain = side_subtree(missing_left)
-        for end, side in reversed(runs):
+        chain = side_subtree(missing_left, 0.5)
+        routed = share(missing_left, 0.5)
+        for end, side, k in reversed(runs):
+            routed += share(side, k)
             n = add(_Node(feature=f, threshold=end + 0.5,
-                          default_left=(side == missing_left)))
-            nodes[n].left = side_subtree(side)
+                          default_left=(side == missing_left),
+                          cover=routed, gain=gn))
+            nodes[n].left = side_subtree(side, k)
             nodes[n].right = chain
             chain = n
         # Leading guard: x < 0 (invalid category) -> missing side.
-        n = add(_Node(feature=f, threshold=-0.5, default_left=missing_left))
-        nodes[n].left = side_subtree(missing_left)
+        n = add(_Node(feature=f, threshold=-0.5, default_left=missing_left,
+                      cover=cv, gain=gn))
+        nodes[n].left = side_subtree(missing_left, 0.5)
         nodes[n].right = chain
         return n
 
@@ -170,6 +203,8 @@ def to_xgboost_dict(model):
                 parents[node.left] = i
                 parents[node.right] = i
         conditions, indices, defaults, weights = [], [], [], []
+        covers = [float(node.cover) for node in nodes]
+        gains = [float(node.gain) for node in nodes]
         for node in nodes:
             if node.feature >= 0:
                 # xgb: x < condition goes left; ours: x <= t. Nudge up 1 ulp.
@@ -195,13 +230,13 @@ def to_xgboost_dict(model):
             "default_left": defaults,
             "id": t,
             "left_children": left,
-            "loss_changes": [0.0] * n,
+            "loss_changes": gains,
             "parents": parents,
             "right_children": right,
             "split_conditions": conditions,
             "split_indices": indices,
             "split_type": [0] * n,
-            "sum_hessian": [1.0] * n,
+            "sum_hessian": covers,      # row counts (== hessian sum for L2)
             "tree_param": {
                 "num_deleted": "0",
                 "num_feature": str(num_features),

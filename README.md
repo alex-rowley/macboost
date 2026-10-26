@@ -279,7 +279,11 @@ model.save_xgboost("model.xgb.json")
 Categorical splits have no XGBoost equivalent, so they are rewritten into
 equivalent numeric-split chains — predictions match to float32 epsilon,
 but exported trees are larger and per-tree introspection won't mirror the
-original.
+original. Each node's `sum_hessian` is its training row count and
+`loss_changes` its split gain, so XGBoost's `pred_contribs` TreeSHAP,
+`shap.TreeExplainer` and cover/gain importances work on the export (row
+count equals the hessian sum for L2 objectives; for other objectives it
+is a count-weighted background, which is also what the native SHAP uses).
 
 **3. ONNX export.** Emit an `ai.onnx.ml` TreeEnsemble for onnxruntime
 (requires the `onnx` package to export, only onnxruntime to serve):
@@ -414,7 +418,7 @@ XGBoost open-source suites (upstream sources cited per test in
   to identical predictions; `.mbds`-trained ≡ raw-trained
 - End-to-end surfaces: `scripts/test_cli.sh` (CSV/TSV/LibSVM/mbds/
   multiclass/importance flows) and `uv run scripts/test_python.py`
-  (78 checks: sklearn interop incl. real GridSearchCV/cross_val_score
+  (80 checks: sklearn interop incl. real GridSearchCV/cross_val_score
   runs, objectives, weights, multiclass with string labels, SHAP,
   guardrails, MLX/PyTorch array interop)
 

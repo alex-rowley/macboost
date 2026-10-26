@@ -256,6 +256,17 @@ with _tf.TemporaryDirectory() as _tmp:
     theirs = bst.predict(_xgb.DMatrix(Xt), output_margin=True)
     gap = float(np.abs(ours - theirs).max())
     check(gap < 3e-4, f"xgboost regression margins match (max gap {gap:.2e}, NaN+cat data)")
+    # Exported covers/gains are the real ones, so XGBoost's TreeSHAP agrees
+    # with the native one (unit placeholders inflated it ~100x).
+    import json as _json
+    with open(f"{_tmp}/m.xgb.json") as _fh:
+        _t0 = _json.load(_fh)["learner"]["gradient_booster"]["model"]["trees"][0]
+    check(_t0["sum_hessian"][0] == len(Xm) and max(_t0["loss_changes"]) > 0,
+          "xgboost export carries root cover and split gains")
+    c_ours = md2.predict_contrib(Xt[:500])
+    c_xgb = bst.predict(_xgb.DMatrix(Xt[:500]), pred_contribs=True)
+    gap = float(np.abs(c_ours - c_xgb).max())
+    check(gap < 1e-3, f"xgboost pred_contribs match native SHAP (max gap {gap:.2e})")
 
     # Binary logistic: compare probabilities.
     clf2 = MacBoostClassifier(n_estimators=40, max_depth=5).fit(Xb, yb)
