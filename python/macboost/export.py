@@ -40,10 +40,10 @@ def _model_dict(model):
 
 class _Node:
     __slots__ = ("feature", "threshold", "default_left", "left", "right",
-                 "value", "cover", "gain")
+                 "value", "cover", "gain", "cats")
 
     def __init__(self, feature=-1, threshold=0.0, default_left=False,
-                 left=-1, right=-1, value=0.0, cover=1.0, gain=0.0):
+                 left=-1, right=-1, value=0.0, cover=1.0, gain=0.0, cats=None):
         self.feature = feature          # -1 => leaf
         self.threshold = threshold      # "x <= threshold" goes left
         self.default_left = default_left
@@ -52,11 +52,13 @@ class _Node:
         self.value = value
         self.cover = cover              # training rows routed through the node
         self.gain = gain                # split gain (0 at leaves)
+        self.cats = cats                # native categorical: ids going right
 
 
-def _explicit_tree(tree, num_bins):
-    """Heap-layout tree -> explicit numeric-only node list (categorical
-    splits expanded into interval chains with duplicated subtrees)."""
+def _explicit_tree(tree, num_bins, native_categorical=False):
+    """Heap-layout tree -> explicit node list. Categorical splits become
+    set-membership nodes (`cats`) when native_categorical, else interval
+    chains of numeric splits with duplicated subtrees."""
     feature = tree["feature"]
     threshold = tree["threshold"]
     leaf = tree["leaf"]
@@ -103,6 +105,12 @@ def _explicit_tree(tree, num_bins):
         # out-of-range categories route to the missing bin's side.
         sides = [member(h, c) for c in range(data_bins)]     # True => left
         missing_left = member(h, data_bins)
+        if native_categorical:
+            n = add(_Node(feature=f, default_left=missing_left, cover=cv, gain=gn,
+                          cats=[c for c in range(data_bins) if not sides[c]]))
+            nodes[n].left = build(2 * h + 1, scale)
+            nodes[n].right = build(2 * h + 2, scale)
+            return n
         runs = []                                     # (end_cat, side, size)
         for c in range(data_bins):
             if runs and runs[-1][1] == sides[c]:
@@ -184,6 +192,7 @@ def _xgb_objective(m):
 
 
 def to_xgboost_dict(model):
+    """XGBoost JSON model dict (loads with xgboost >= 1.6)."""
     m = _model_dict(model)
     num_features = int(m["numFeatures"])
     num_bins = int(m["numBins"])
@@ -192,8 +201,9 @@ def to_xgboost_dict(model):
     obj_name, obj_param = _xgb_objective(m)
 
     trees_json = []
+    cat_features = set()
     for t, tree in enumerate(m["trees"]):
-        nodes = _explicit_tree(tree, num_bins)
+        nodes = _explicit_tree(tree, num_bins, native_categorical=True)
         n = len(nodes)
         left = [node.left for node in nodes]
         right = [node.right for node in nodes]
@@ -205,7 +215,16 @@ def to_xgboost_dict(model):
         conditions, indices, defaults, weights = [], [], [], []
         covers = [float(node.cover) for node in nodes]
         gains = [float(node.gain) for node in nodes]
-        for node in nodes:
+        split_type = [0] * n
+        cat_nodes, cat_segments, cat_sizes, cats = [], [], [], []
+        for i, node in enumerate(nodes):
+            if node.cats is not None:
+                split_type[i] = 1
+                cat_nodes.append(i)
+                cat_segments.append(len(cats))
+                cat_sizes.append(len(node.cats))
+                cats.extend(node.cats)
+                cat_features.add(node.feature)
             if node.feature >= 0:
                 # xgb: x < condition goes left; ours: x <= t. Nudge up 1 ulp.
                 thr = float(np.nextafter(np.float32(node.threshold),
@@ -225,8 +244,8 @@ def to_xgboost_dict(model):
                 weights.append(value)
         trees_json.append({
             "base_weights": weights,
-            "categories": [], "categories_nodes": [],
-            "categories_segments": [], "categories_sizes": [],
+            "categories": cats, "categories_nodes": cat_nodes,
+            "categories_segments": cat_segments, "categories_sizes": cat_sizes,
             "default_left": defaults,
             "id": t,
             "left_children": left,
@@ -235,7 +254,7 @@ def to_xgboost_dict(model):
             "right_children": right,
             "split_conditions": conditions,
             "split_indices": indices,
-            "split_type": [0] * n,
+            "split_type": split_type,
             "sum_hessian": covers,      # row counts (== hessian sum for L2)
             "tree_param": {
                 "num_deleted": "0",
@@ -251,7 +270,8 @@ def to_xgboost_dict(model):
         "learner": {
             "attributes": {},
             "feature_names": [],
-            "feature_types": [],
+            "feature_types": (["c" if f in cat_features else "float"
+                               for f in range(num_features)] if cat_features else []),
             "gradient_booster": {
                 "model": {
                     "gbtree_model_param": {

@@ -276,14 +276,16 @@ model.save_xgboost("model.xgb.json")
 # elsewhere: bst = xgb.Booster(); bst.load_model("model.xgb.json")
 ```
 
-Categorical splits have no XGBoost equivalent, so they are rewritten into
-equivalent numeric-split chains — predictions match to float32 epsilon,
-but exported trees are larger and per-tree introspection won't mirror the
-original. Each node's `sum_hessian` is its training row count and
-`loss_changes` its split gain, so XGBoost's `pred_contribs` TreeSHAP,
-`shap.TreeExplainer` and cover/gain importances work on the export (row
-count equals the hessian sum for L2 objectives; for other objectives it
-is a count-weighted background, which is also what the native SHAP uses).
+Categorical splits are written as native XGBoost set-membership splits,
+so the export needs `xgboost >= 1.6` to load and scores plain numeric
+arrays (no `enable_categorical` needed). Each node carries its training
+row count as `sum_hessian` and its split gain as `loss_changes`, so
+XGBoost's `pred_contribs` TreeSHAP, `shap.TreeExplainer` and cover/gain
+importances agree with MacBoost's native ones (row count equals the
+hessian sum for L2 objectives; for other objectives it is the same
+count-weighted background the native SHAP uses). One difference: category
+ids outside `0..max_bin-2` go to the missing side in MacBoost but always
+left in XGBoost, so keep ids in range.
 
 **3. ONNX export.** Emit an `ai.onnx.ml` TreeEnsemble for onnxruntime
 (requires the `onnx` package to export, only onnxruntime to serve):
@@ -292,6 +294,11 @@ is a count-weighted background, which is also what the native SHAP uses).
 model.save_onnx("model.onnx")
 # elsewhere: ort.InferenceSession("model.onnx").run(["prediction"], {"input": X})
 ```
+
+The ONNX TreeEnsemble has no set-membership split, so categorical splits
+are expanded into numeric-split chains with duplicated subtrees. That is
+exact but grows multiplicatively with nested high-cardinality categorical
+splits; prefer the XGBoost export for models with many-level categoricals.
 
 The graph outputs what `predict` returns: probabilities for classifiers,
 means for poisson/tweedie, raw scores for regression.
@@ -418,7 +425,7 @@ XGBoost open-source suites (upstream sources cited per test in
   to identical predictions; `.mbds`-trained ≡ raw-trained
 - End-to-end surfaces: `scripts/test_cli.sh` (CSV/TSV/LibSVM/mbds/
   multiclass/importance flows) and `uv run scripts/test_python.py`
-  (80 checks: sklearn interop incl. real GridSearchCV/cross_val_score
+  (81 checks: sklearn interop incl. real GridSearchCV/cross_val_score
   runs, objectives, weights, multiclass with string labels, SHAP,
   guardrails, MLX/PyTorch array interop)
 

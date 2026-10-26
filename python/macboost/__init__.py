@@ -363,9 +363,9 @@ class _BaseBooster:
             _core.predict_contrib(self._handle, _interop.to_numpy(X)))
 
     def save_xgboost(self, path):
-        """Export as an XGBoost JSON model for deployment anywhere xgboost
-        runs (identical predictions; categorical splits are expanded into
-        equivalent numeric chains)."""
+        """Export as an XGBoost JSON model (xgboost >= 1.6) for deployment
+        anywhere xgboost runs: identical predictions, native categorical
+        splits, real covers and gains so TreeSHAP works on the export."""
         from . import export
         export.save_xgboost(self, path)
 

@@ -263,6 +263,8 @@ with _tf.TemporaryDirectory() as _tmp:
         _t0 = _json.load(_fh)["learner"]["gradient_booster"]["model"]["trees"][0]
     check(_t0["sum_hessian"][0] == len(Xm) and max(_t0["loss_changes"]) > 0,
           "xgboost export carries root cover and split gains")
+    check(1 in _t0["split_type"] and len(_t0["split_type"]) < 2 ** 7,
+          "xgboost export uses native categorical splits (no chain expansion)")
     c_ours = md2.predict_contrib(Xt[:500])
     c_xgb = bst.predict(_xgb.DMatrix(Xt[:500]), pred_contribs=True)
     gap = float(np.abs(c_ours - c_xgb).max())
