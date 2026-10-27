@@ -583,8 +583,24 @@ check(pm_.n_features_in_ == _d + 2 and pm_.projection_.output_width == _k + 2,
 _rm = float(np.sqrt(np.mean((pm_.predict(Xe[20000:]) - ye[20000:]) ** 2)))
 _rr = float(np.sqrt(np.mean((pr_.predict(Ze[20000:]) - ye[20000:]) ** 2)))
 check(abs(_rm - _rr) < 0.02 * max(_rr, 1e-6), f"fit with projection matches pre-projected fit (RMSE {_rm:.4f} vs {_rr:.4f})")
-check(np.array_equal(pm_.predict(Xe[:500]), pm_.predict(Ze[:500])),
-      "raw-width and projected-width inputs score identically")
+try:
+    pm_.predict(Ze[:500]); _ok = False
+except MacBoostError:
+    _ok = True
+check(_ok, "projected model rejects already-projected input (raw width only)")
+# Square (full-rank) projection: width cannot disambiguate, so it must always apply.
+_Qs = np.linalg.qr(rng.standard_normal((_d + 2, _d + 2)))[0].astype(np.float32)
+psq = Projection(_d + 2).add_block(range(_d + 2), np.zeros(_d + 2, np.float32), _Qs)
+sq = MacBoostRegressor(n_estimators=40, max_depth=5, projection=psq).fit(Xe[:20000], ye[:20000])
+sq_ref = MacBoostRegressor(n_estimators=40, max_depth=5).fit(psq.apply(Xe[:20000]), ye[:20000])
+_gap = float(np.abs(sq.predict(Xe[20000:21000]) - sq_ref.predict(psq.apply(Xe[20000:21000]))).max())
+_raw_gap = float(np.abs(sq.predict(Xe[20000:21000]) - sq_ref.predict(Xe[20000:21000])).max())
+check(_gap < 0.05 and _raw_gap > 0.5, f"square projection is applied at predict (gap {_gap:.3f}, unprojected {_raw_gap:.2f})")
+with _tf.TemporaryDirectory() as _tmp:
+    sq.save_model(f"{_tmp}/sq.json")
+    from macboost._pyinfer import PyModel as _PM
+    check(np.abs(_PM(f"{_tmp}/sq.json").predict(Xe[20000:21000]) - sq.predict(Xe[20000:21000])).max() < 1e-4,
+          "pure-Python predictor applies a square projection")
 check(pm_.predict_contrib(Xe[:50]).shape == (50, _k + 3), "SHAP is in projected space (+ bias)")
 with _tf.TemporaryDirectory() as _tmp:
     pm_.save_model(f"{_tmp}/p.json")
@@ -607,8 +623,9 @@ with _tf.TemporaryDirectory() as _tmp:
     pf = Projection.from_pca(_Vt[:_k], _mu, input_width=_d + 2, inputs=range(_d), passthrough=[_d, _d + 1])
     pf.fill = np.full(_d + 2, np.nan, dtype=np.float32); pf.fill[3] = _mu[3]
     post = MacBoostRegressor(n_estimators=20, max_depth=4).fit(pf.apply(Xn_[:10000]), ye[:10000])
+    _before = post.predict(pf.apply(Xn_[10000:11000]))
     post.set_projection(pf)
-    check(np.array_equal(post.predict(Xn_[10000:11000]), post.predict(pf.apply(Xn_[10000:11000])))
+    check(np.abs(post.predict(Xn_[10000:11000]) - _before).max() < 1e-4
           and post.n_features_in_ == _d + 2, "set_projection attaches to a trained model; fill handles NaN")
     post.save_onnx(f"{_tmp}/f.onnx")
     _o = _ort.InferenceSession(f"{_tmp}/f.onnx").run(["prediction"], {"input": Xn_[10000:11000]})[0][:, 0]

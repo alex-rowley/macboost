@@ -93,10 +93,8 @@ class PyModel:
 
     def predict_raw(self, X):
         X = np.asarray(X, dtype=np.float32)
-        if self.projection is not None and X.ndim == 2 \
-                and X.shape[1] == self.projection.input_width \
-                and X.shape[1] != self.num_features:
-            X = self.projection.apply(X)
+        if self.projection is not None:
+            X = self.projection.apply(X)          # raises on a width mismatch
         if X.ndim != 2 or X.shape[1] != self.num_features:
             raise ValueError(
                 f"X must be (n, {self.num_features}), got {X.shape}")

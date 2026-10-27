@@ -42,10 +42,15 @@ extension MacBooster {
     /// layout). Rows (per class block) sum to the RAW score.
     public func predictContributions(featureMajor X: [Float], rows: Int,
                                      cols: Int) -> [Float] {
-        if let proj = projection, cols == proj.inputWidth, cols != numFeatures {
-            return predictContributions(featureMajor: proj.apply(featureMajor: X, rows: rows),
-                                        rows: rows, cols: numFeatures)
+        if let proj = projection {
+            precondition(cols == proj.inputWidth, "projected model takes raw-width input")
+            return contributionsTrees(featureMajor: proj.apply(featureMajor: X, rows: rows),
+                                      rows: rows, cols: numFeatures)
         }
+        return contributionsTrees(featureMajor: X, rows: rows, cols: cols)
+    }
+
+    func contributionsTrees(featureMajor X: [Float], rows: Int, cols: Int) -> [Float] {
         precondition(cols == numFeatures)
         if rows >= shapGPUMinRows, !trees.isEmpty,
            let out = predictContributionsGPU(featureMajor: X, rows: rows,

@@ -47,8 +47,6 @@ final class ProjectionTests: XCTestCase {
         let ref = try MacBooster(params: p)
         try ref.fit(featureMajor: Z, rows: rows, cols: 3, labels: y)
         let predRaw = b.predict(featureMajor: X, rows: rows, cols: 6)
-        let predZ = b.predict(featureMajor: Z, rows: rows, cols: 3)
-        XCTAssertEqual(predRaw, predZ, "raw-width and projected-width inputs must agree")
         let refPred = ref.predict(featureMajor: Z, rows: rows, cols: 3)
         for i in stride(from: 0, to: rows, by: 53) {
             XCTAssertEqual(predRaw[i], refPred[i], accuracy: 1e-4)
@@ -61,6 +59,42 @@ final class ProjectionTests: XCTestCase {
         let loaded = try MacBooster.load(from: url)
         XCTAssertEqual(loaded.projection, proj)
         XCTAssertEqual(loaded.predict(featureMajor: X, rows: rows, cols: 6), predRaw)
+    }
+
+    /// A full-rank (square) projection cannot be told apart from raw input
+    /// by width, so the rule is: with a projection attached, input is raw.
+    func testSquareProjectionIsAlwaysApplied() throws {
+        let rows = 6_000
+        let (X, y) = makeData(rows: rows, seed: 404)
+        // 6×6 rotation mixing columns 0,1 (a+b, a−b -> a, b) and permuting the rest.
+        let proj = InputProjection(inputWidth: 6, blocks: [
+            ProjectionBlock(inputs: [0, 1, 2, 3, 4, 5], mean: [0, 0, 0, 0, 0, 0],
+                            matrix: [0.5, 0.5, 0, 0, 0, 0,
+                                     0.5, -0.5, 0, 0, 0, 0,
+                                     0, 0, 0, 0, 0, 1,
+                                     0, 0, 1, 0, 0, 0,
+                                     0, 0, 0, 1, 0, 0,
+                                     0, 0, 0, 0, 1, 0], outputs: 6)])
+        var p = BoosterParams(); p.numTrees = 30; p.maxDepth = 4
+        let b = try MacBooster(params: p)
+        try b.setProjection(proj)
+        try b.fit(featureMajor: X, rows: rows, cols: 6, labels: y)
+        let Z = X.withUnsafeBufferPointer {
+            proj.apply(MatrixView(base: $0.baseAddress!, rows: rows, cols: 6, rowMajor: false))
+        }
+        let ref = try MacBooster(params: p)
+        try ref.fit(featureMajor: Z, rows: rows, cols: 6, labels: y)
+        let pred = b.predict(featureMajor: X, rows: rows, cols: 6)
+        let refPred = ref.predict(featureMajor: Z, rows: rows, cols: 6)
+        var maxGap: Float = 0
+        for i in 0..<rows { maxGap = max(maxGap, abs(pred[i] - refPred[i])) }
+        XCTAssertLessThan(maxGap, 0.05, "square projection must be applied at predict")
+        var X32 = [Float](repeating: 0, count: 32 * 6)      // feature-major slice
+        for j in 0..<6 { for i in 0..<32 { X32[j * 32 + i] = X[j * rows + i] } }
+        let shap = b.predictContributions(featureMajor: X32, rows: 32, cols: 6)
+        var sums = [Float](repeating: 0, count: 32)
+        for i in 0..<32 { for j in 0..<7 { sums[i] += shap[i * 7 + j] } }
+        for i in 0..<32 { XCTAssertEqual(sums[i], pred[i], accuracy: 1e-3) }
     }
 
     func testProjectionValidation() throws {

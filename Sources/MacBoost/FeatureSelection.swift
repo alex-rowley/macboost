@@ -58,15 +58,29 @@ extension MacBooster {
                                seed: UInt64 = 0,
                                progress: ((String) -> Void)? = nil) throws
         -> FeatureSelectionResult {
+        if let proj = projection {
+            guard rows > 0, cols == proj.inputWidth, X.count == rows * cols else {
+                throw MacBoostError.invalidInput(
+                    "projection expects \(proj.inputWidth) input columns, X has \(cols)")
+            }
+            return try selectFeaturesTrees(
+                featureMajor: proj.apply(featureMajor: X, rows: rows), rows: rows,
+                cols: proj.outputWidth, labels: labels, weights: weights, rounds: rounds,
+                trees: trees, alpha: alpha, seed: seed, progress: progress)
+        }
+        return try selectFeaturesTrees(featureMajor: X, rows: rows, cols: cols, labels: labels,
+                                       weights: weights, rounds: rounds, trees: trees,
+                                       alpha: alpha, seed: seed, progress: progress)
+    }
+
+    func selectFeaturesTrees(featureMajor X: [Float], rows: Int, cols: Int,
+                             labels: [Float], weights: [Float]?,
+                             rounds: Int, trees: Int?, alpha: Double, seed: UInt64,
+                             progress: ((String) -> Void)?) throws
+        -> FeatureSelectionResult {
         guard rows > 0 && cols > 0, X.count == rows * cols else {
             throw MacBoostError.invalidInput(
                 "selection data shapes inconsistent (rows=\(rows), cols=\(cols), X=\(X.count))")
-        }
-        if let proj = projection, cols == proj.inputWidth, cols != proj.outputWidth {
-            return try selectFeatures(featureMajor: proj.apply(featureMajor: X, rows: rows),
-                                      rows: rows, cols: proj.outputWidth, labels: labels,
-                                      weights: weights, rounds: rounds, trees: trees,
-                                      alpha: alpha, seed: seed, progress: progress)
         }
         guard labels.count == rows else {
             throw MacBoostError.invalidInput("labels has \(labels.count) rows, X has \(rows)")

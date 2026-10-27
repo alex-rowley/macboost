@@ -2110,10 +2110,16 @@ public final class MacBooster {
     }
 
     public func predict(featureMajor X: [Float], rows: Int, cols: Int) -> [Float] {
-        if let proj = projection, cols == proj.inputWidth, cols != numFeatures {
-            return predict(featureMajor: proj.apply(featureMajor: X, rows: rows),
-                           rows: rows, cols: numFeatures)
+        if let proj = projection {
+            precondition(cols == proj.inputWidth, "projected model takes raw-width input")
+            return predictTrees(featureMajor: proj.apply(featureMajor: X, rows: rows),
+                                rows: rows, cols: numFeatures)
         }
+        return predictTrees(featureMajor: X, rows: rows, cols: cols)
+    }
+
+    /// Predict on already-projected (tree-width) input.
+    func predictTrees(featureMajor X: [Float], rows: Int, cols: Int) -> [Float] {
         var out = predictRawScores(featureMajor: X, rows: rows, cols: cols)
         if params.objective.usesLogLink {
             for i in 0..<out.count { out[i] = exp(out[i]) }

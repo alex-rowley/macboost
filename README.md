@@ -131,7 +131,7 @@ dependencies):
 ```sh
 git clone https://github.com/alex-rowley/macboost && cd macboost
 swift build -c release        # library, CLI (.build/release/macboost), dylib
-swift test                    # 82 behavioural tests
+swift test                    # 83 behavioural tests
 ./scripts/build_wheel.sh && pip install python/dist/*.whl
 ```
 
@@ -378,7 +378,9 @@ trained_on_scores.set_projection(proj)            # attach to an existing model
 model.projection_                                 # the stored Projection
 ```
 
-Any number of blocks compose: N PCAs over different column groups, a
+With a projection attached, input is always raw width; a full-rank
+projection has the same width in and out, so width cannot say which space
+a matrix is in, and MacBoost does not guess. Any number of blocks compose: N PCAs over different column groups, a
 scaler in front of one of them, a PCA of a PCA, all reduce to one affine
 map. `fill` gives a per-column NaN replacement before projection (PCA
 cannot take NaN); passthrough columns keep MacBoost's native NaN routing.
@@ -499,7 +501,7 @@ within ±0.03 of alpha).
 
 ## Tests
 
-`swift test` runs 82 behavioural tests adapted from the LightGBM and
+`swift test` runs 83 behavioural tests adapted from the LightGBM and
 XGBoost open-source suites (upstream sources cited per test in
 `Tests/MacBoostTests/`):
 
@@ -519,7 +521,7 @@ XGBoost open-source suites (upstream sources cited per test in
   a stored projection scores raw and pre-projected input identically
 - End-to-end surfaces: `scripts/test_cli.sh` (CSV/TSV/LibSVM/mbds/
   multiclass/importance flows) and `uv run scripts/test_python.py`
-  (109 checks: sklearn interop incl. real GridSearchCV/cross_val_score
+  (111 checks: sklearn interop incl. real GridSearchCV/cross_val_score
   runs, objectives, weights, multiclass with string labels, SHAP,
   guardrails, calibration folds, input projections, MLX/PyTorch array interop)
 

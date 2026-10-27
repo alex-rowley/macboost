@@ -200,7 +200,7 @@ public func macboost_predict(
 ) -> Int32 {
     guard let handle, let x, let out else { setError(err, "null argument"); return -1 }
     let b = booster(handle)
-    guard Int(cols) == b.inputWidth || Int(cols) == b.numFeatures else {
+    guard Int(cols) == b.inputWidth else {
         setError(err, "model expects \(b.inputWidth) features, got \(cols)")
         return -1
     }
@@ -238,7 +238,7 @@ public func macboost_predict_contrib(
 ) -> Int32 {
     guard let handle, let x, let out else { setError(err, "null argument"); return -1 }
     let b = booster(handle)
-    guard Int(cols) == b.inputWidth || Int(cols) == b.numFeatures else {
+    guard Int(cols) == b.inputWidth else {
         setError(err, "model expects \(b.inputWidth) features, got \(cols)")
         return -1
     }
