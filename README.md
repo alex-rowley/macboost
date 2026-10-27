@@ -378,6 +378,14 @@ trained_on_scores.set_projection(proj)            # attach to an existing model
 model.projection_                                 # the stored Projection
 ```
 
+Prefer fitting with the projection in place over attaching it afterwards.
+MacBoost projects in float32; a model trained on scores computed
+elsewhere in float64 (sklearn's `PCA.transform`) saw values that differ
+in the last bits, and rows sitting on a split threshold flip. Fitting
+with `projection=` uses the same float32 projection at fit and predict,
+so it is exact. `set_projection` is right when the scores were produced
+by `Projection.apply`, which is the same arithmetic.
+
 With a projection attached, input is always raw width; a full-rank
 projection has the same width in and out, so width cannot say which space
 a matrix is in, and MacBoost does not guess. Any number of blocks compose: N PCAs over different column groups, a
