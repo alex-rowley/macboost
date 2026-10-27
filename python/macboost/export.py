@@ -194,6 +194,10 @@ def _xgb_objective(m):
 def to_xgboost_dict(model):
     """XGBoost JSON model dict (loads with xgboost >= 1.6)."""
     m = _model_dict(model)
+    if m.get("projection"):
+        raise ValueError(
+            "XGBoost JSON cannot carry an input projection; apply "
+            "model.projection_.apply(X) before scoring the export, or use ONNX")
     num_features = int(m["numFeatures"])
     num_bins = int(m["numBins"])
     k = int(m.get("numClasses") or 1)
@@ -355,11 +359,50 @@ def to_onnx(model):
                 attrs["target_ids"].append(t % k)
                 attrs["target_weights"].append(node.value)
 
+    nodes, inits = [], []
+    input_width = num_features
+    proj = m.get("projection")
+    if proj:                                        # affine front end, exact
+        from .projection import Projection
+        pr = Projection.from_dict(proj)
+        input_width = pr.input_width
+        src = "input"
+        if pr.fill is not None and np.isfinite(pr.fill).any():
+            fill = np.where(np.isnan(pr.fill), 0, pr.fill).astype(np.float32)
+            keep = np.isnan(pr.fill)
+            inits.append(helper.make_tensor("proj_fill", TensorProto.FLOAT, [input_width], fill))
+            inits.append(helper.make_tensor("proj_keep", TensorProto.BOOL, [input_width], keep))
+            nodes += [helper.make_node("IsNaN", ["input"], ["proj_isnan"]),
+                      helper.make_node("Not", ["proj_keep"], ["proj_fillable"]),
+                      helper.make_node("And", ["proj_isnan", "proj_fillable"], ["proj_mask"]),
+                      helper.make_node("Where", ["proj_mask", "proj_fill", "input"], ["proj_filled"])]
+            src = "proj_filled"
+        parts = []
+        for i, b in enumerate(pr.blocks):
+            inits += [helper.make_tensor(f"proj_idx{i}", TensorProto.INT64, [len(b["inputs"])], b["inputs"]),
+                      helper.make_tensor(f"proj_mean{i}", TensorProto.FLOAT, [len(b["inputs"])], b["mean"]),
+                      helper.make_tensor(f"proj_w{i}", TensorProto.FLOAT, list(b["matrix"].T.shape),
+                                         np.ascontiguousarray(b["matrix"].T))]
+            nodes += [helper.make_node("Gather", [src, f"proj_idx{i}"], [f"proj_g{i}"], axis=1),
+                      helper.make_node("Sub", [f"proj_g{i}", f"proj_mean{i}"], [f"proj_c{i}"]),
+                      helper.make_node("MatMul", [f"proj_c{i}", f"proj_w{i}"], [f"proj_z{i}"])]
+            parts.append(f"proj_z{i}")
+        if pr.passthrough:
+            inits.append(helper.make_tensor("proj_pass", TensorProto.INT64, [len(pr.passthrough)], pr.passthrough))
+            nodes.append(helper.make_node("Gather", [src, "proj_pass"], ["proj_passed"], axis=1))
+            parts.append("proj_passed")
+        if len(parts) == 1:
+            nodes.append(helper.make_node("Identity", parts, ["features"]))
+        else:
+            nodes.append(helper.make_node("Concat", parts, ["features"], axis=1))
+        tree_input = "features"
+    else:
+        tree_input = "input"
     ensemble = helper.make_node(
-        "TreeEnsembleRegressor", ["input"], ["margin"],
+        "TreeEnsembleRegressor", [tree_input], ["margin"],
         domain="ai.onnx.ml", n_targets=k, base_values=base_scores,
         post_transform="NONE", **attrs)
-    nodes = [ensemble]
+    nodes.append(ensemble)
     if obj == 1:                                    # logistic -> probability
         nodes.append(helper.make_node("Sigmoid", ["margin"], ["prediction"]))
     elif obj == 7:                                  # multiclass -> probabilities
@@ -372,9 +415,10 @@ def to_onnx(model):
     graph = helper.make_graph(
         nodes, "macboost",
         [helper.make_tensor_value_info("input", TensorProto.FLOAT,
-                                       [None, num_features])],
+                                       [None, input_width])],
         [helper.make_tensor_value_info("prediction", TensorProto.FLOAT,
                                        [None, k])],
+        initializer=inits,
     )
     onnx_model = helper.make_model(
         graph, opset_imports=[helper.make_opsetid("ai.onnx.ml", 1),

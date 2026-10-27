@@ -89,8 +89,12 @@ def _configure(_lib):
     _lib.macboost_calibration.restype = ctypes.c_int64
     _lib.macboost_calibration.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float),
                                           _f32_p, ctypes.c_int64]
+    _lib.macboost_set_projection.restype = ctypes.c_int32
+    _lib.macboost_set_projection.argtypes = [ctypes.c_void_p, ctypes.c_char_p, _c_char_pp]
+    _lib.macboost_projection.restype = ctypes.c_void_p
+    _lib.macboost_projection.argtypes = [ctypes.c_void_p]
     for name in ("macboost_num_trees", "macboost_num_features", "macboost_best_iteration",
-                 "macboost_num_classes"):
+                 "macboost_num_classes", "macboost_input_width"):
         fn = getattr(_lib, name)
         fn.restype = ctypes.c_int64
         fn.argtypes = [ctypes.c_void_p]
@@ -228,13 +232,14 @@ def predict(handle: _Handle, X) -> np.ndarray:
 def predict_contrib(handle: _Handle, X) -> np.ndarray:
     Xf, rows, cols = _feature_major(X)
     k = _lib.macboost_num_classes(handle.ptr)
-    out = np.empty(rows * k * (cols + 1), dtype=np.float32)
+    f = _lib.macboost_num_features(handle.ptr)     # tree width (projected space)
+    out = np.empty(rows * k * (f + 1), dtype=np.float32)
     err = ctypes.c_char_p()
     rc = _lib.macboost_predict_contrib(handle.ptr, _f32(Xf), rows, cols,
                                        _f32(out), ctypes.byref(err))
     if rc != 0:
         raise MacBoostError(_take_error(err))
-    return out.reshape(rows, k * (cols + 1))
+    return out.reshape(rows, k * (f + 1))
 
 
 def feature_importance(handle: _Handle, importance_type: str) -> np.ndarray:
@@ -298,3 +303,23 @@ def calibration(handle: _Handle) -> dict | None:
         return None
     return {"scale": float(scale.value), "offset": off.astype(np.float64).tolist(),
             "folds": int(folds)}
+
+
+def set_projection(handle: _Handle, proj_dict) -> None:
+    err = ctypes.c_char_p()
+    payload = json.dumps(proj_dict).encode() if proj_dict is not None else b""
+    if _lib.macboost_set_projection(handle.ptr, payload, ctypes.byref(err)) != 0:
+        raise MacBoostError(_take_error(err))
+
+
+def projection(handle: _Handle):
+    ptr = _lib.macboost_projection(handle.ptr)
+    if not ptr:
+        return None
+    text = ctypes.cast(ptr, ctypes.c_char_p).value.decode()
+    _lib.macboost_free_string(ctypes.cast(ptr, ctypes.c_char_p))
+    return json.loads(text)
+
+
+def input_width(handle: _Handle) -> int:
+    return _lib.macboost_input_width(handle.ptr)

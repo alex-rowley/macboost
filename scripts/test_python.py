@@ -562,6 +562,66 @@ reg_f = MacBoostRegressor(n_estimators=10).fit(_X3[:4000], _X3[:4000, 0])
 _b4 = reg_f.predict(_X3[:200]); reg_f.fold(2.0, 1.0)
 check(np.abs(reg_f.predict(_X3[:200]) - (2 * _b4 + 1)).max() < 1e-4, "fold is an affine map for regressors too")
 
+print("input projection")
+from macboost import Projection
+_d, _k = 32, 6
+_Qr, _ = np.linalg.qr(rng.standard_normal((_d, _d)))
+_lat = rng.standard_normal((30_000, _d)).astype(np.float32) * np.linspace(3, 0.1, _d, dtype=np.float32)
+_E = (_lat @ _Qr.T).astype(np.float32)
+_tab = rng.random((30_000, 2), dtype=np.float32)
+Xe = np.column_stack([_E, _tab]).astype(np.float32)
+ye = (2 * _lat[:, 0] - _lat[:, 1] + 3 * _tab[:, 0] + 0.3 * rng.standard_normal(30_000)).astype(np.float32)
+_mu = _E[:20000].mean(0)
+_Vt = np.linalg.svd(_E[:20000] - _mu, full_matrices=False)[2]
+pe = Projection.from_pca(_Vt[:_k], _mu, input_width=_d + 2, inputs=range(_d), passthrough=[_d, _d + 1])
+Ze = pe.apply(Xe)
+pm_ = MacBoostRegressor(n_estimators=60, max_depth=5, projection=pe).fit(
+    Xe[:20000], ye[:20000], eval_set=(Xe[20000:], ye[20000:]))
+pr_ = MacBoostRegressor(n_estimators=60, max_depth=5).fit(Ze[:20000], ye[:20000])
+check(pm_.n_features_in_ == _d + 2 and pm_.projection_.output_width == _k + 2,
+      "projected model takes raw width, trees see projected width")
+_rm = float(np.sqrt(np.mean((pm_.predict(Xe[20000:]) - ye[20000:]) ** 2)))
+_rr = float(np.sqrt(np.mean((pr_.predict(Ze[20000:]) - ye[20000:]) ** 2)))
+check(abs(_rm - _rr) < 0.02 * max(_rr, 1e-6), f"fit with projection matches pre-projected fit (RMSE {_rm:.4f} vs {_rr:.4f})")
+check(np.array_equal(pm_.predict(Xe[:500]), pm_.predict(Ze[:500])),
+      "raw-width and projected-width inputs score identically")
+check(pm_.predict_contrib(Xe[:50]).shape == (50, _k + 3), "SHAP is in projected space (+ bias)")
+with _tf.TemporaryDirectory() as _tmp:
+    pm_.save_model(f"{_tmp}/p.json")
+    pl_ = MacBoostRegressor.load_model(f"{_tmp}/p.json")
+    check(np.array_equal(pl_.predict(Xe[:500]), pm_.predict(Xe[:500])) and pl_.projection_ is not None,
+          "projection survives save/load")
+    from macboost._pyinfer import PyModel
+    check(np.abs(PyModel(f"{_tmp}/p.json").predict(Xe[:500]) - pm_.predict(Xe[:500])).max() < 1e-4,
+          "pure-Python predictor applies the stored projection")
+    pm_.save_onnx(f"{_tmp}/p.onnx")
+    _o = _ort.InferenceSession(f"{_tmp}/p.onnx").run(["prediction"], {"input": Xe[:500]})[0][:, 0]
+    check(np.abs(_o - pm_.predict(Xe[:500])).max() < 1e-4, "ONNX export carries the projection as graph nodes")
+    try:
+        pm_.save_xgboost(f"{_tmp}/p.xgb.json"); _ok = False
+    except ValueError:
+        _ok = True
+    check(_ok, "XGBoost export refuses a projected model with a clear error")
+    # Post-hoc attach with a NaN fill.
+    Xn_ = Xe.copy(); Xn_[rng.random(30_000) < 0.05, 3] = np.nan
+    pf = Projection.from_pca(_Vt[:_k], _mu, input_width=_d + 2, inputs=range(_d), passthrough=[_d, _d + 1])
+    pf.fill = np.full(_d + 2, np.nan, dtype=np.float32); pf.fill[3] = _mu[3]
+    post = MacBoostRegressor(n_estimators=20, max_depth=4).fit(pf.apply(Xn_[:10000]), ye[:10000])
+    post.set_projection(pf)
+    check(np.array_equal(post.predict(Xn_[10000:11000]), post.predict(pf.apply(Xn_[10000:11000])))
+          and post.n_features_in_ == _d + 2, "set_projection attaches to a trained model; fill handles NaN")
+    post.save_onnx(f"{_tmp}/f.onnx")
+    _o = _ort.InferenceSession(f"{_tmp}/f.onnx").run(["prediction"], {"input": Xn_[10000:11000]})[0][:, 0]
+    check(np.abs(_o - post.predict(Xn_[10000:11000])).max() < 1e-4, "ONNX export applies the NaN fill")
+try:
+    MacBoostRegressor(n_estimators=5, projection=pe).fit(Xe[:1000, :10], ye[:1000]); _ok = False
+except MacBoostError:
+    _ok = True
+check(_ok, "fit rejects X whose width does not match the projection")
+_sel = MacBoostRegressor(projection=pe).select_features(Xe[:15000], ye[:15000], rounds=10)
+check(len(_sel.hits) == _k + 2 and 6 in _sel.confirmed_ and 7 not in _sel.confirmed_,
+      "Boruta with a projection scores the projected columns")
+
 print("tier 1+2 features")
 # Multiclass with arbitrary label values (auto-encoded).
 Xm3 = rng.random((8_000, 4), dtype=np.float32)

@@ -37,6 +37,7 @@ private struct CConfig: Codable {
     var init_model: String?
     var allowed_features: [Int]?
     var num_leaves: Int?
+    var projection: InputProjection?
 }
 
 private func makeParams(_ cfg: CConfig) throws -> BoosterParams {
@@ -109,6 +110,7 @@ public func macboost_train(
             cfg = try JSONDecoder().decode(CConfig.self, from: data)
         }
         let b = try MacBooster(params: makeParams(cfg))
+        if let proj = cfg.projection { try b.setProjection(proj) }
         let Y = Array(UnsafeBufferPointer(start: y, count: Int(rows)))
         var evalSet: EvalSet?
         if let xValid, let yValid, validRows > 0 {
@@ -165,6 +167,7 @@ public func macboost_select_features(
         }
         let verbose = cfg.verbose ?? false
         let b = try MacBooster(params: makeParams(cfg))
+        if let proj = cfg.projection { try b.setProjection(proj) }
         let X = Array(UnsafeBufferPointer(start: x, count: Int(rows * cols)))
         let Y = Array(UnsafeBufferPointer(start: y, count: Int(rows)))
         let weights = w.map { Array(UnsafeBufferPointer(start: $0, count: Int(rows))) }
@@ -174,7 +177,7 @@ public func macboost_select_features(
             trees: trees > 0 ? Int(trees) : nil, alpha: Double(alpha),
             seed: UInt64(bitPattern: seed),
             progress: verbose ? { print($0) } : nil)
-        for f in 0..<Int(cols) {
+        for f in 0..<result.hits.count {
             outHits[f] = Int32(result.hits[f])
             outDecision[f] = 1
             outGainRatio[f] = result.gainRatio[f]
@@ -197,8 +200,8 @@ public func macboost_predict(
 ) -> Int32 {
     guard let handle, let x, let out else { setError(err, "null argument"); return -1 }
     let b = booster(handle)
-    guard Int(cols) == b.numFeatures else {
-        setError(err, "model expects \(b.numFeatures) features, got \(cols)")
+    guard Int(cols) == b.inputWidth || Int(cols) == b.numFeatures else {
+        setError(err, "model expects \(b.inputWidth) features, got \(cols)")
         return -1
     }
     let X = Array(UnsafeBufferPointer(start: x, count: Int(rows * cols)))
@@ -235,8 +238,8 @@ public func macboost_predict_contrib(
 ) -> Int32 {
     guard let handle, let x, let out else { setError(err, "null argument"); return -1 }
     let b = booster(handle)
-    guard Int(cols) == b.numFeatures else {
-        setError(err, "model expects \(b.numFeatures) features, got \(cols)")
+    guard Int(cols) == b.inputWidth || Int(cols) == b.numFeatures else {
+        setError(err, "model expects \(b.inputWidth) features, got \(cols)")
         return -1
     }
     let X = Array(UnsafeBufferPointer(start: x, count: Int(rows * cols)))
@@ -304,6 +307,42 @@ public func macboost_calibration(
     scale.pointee = c.scale
     for (i, v) in c.offset.enumerated() { offset[i] = v }
     return Int64(c.folds)
+}
+
+@_cdecl("macboost_input_width")
+public func macboost_input_width(_ handle: UnsafeMutableRawPointer?) -> Int64 {
+    guard let handle else { return -1 }
+    return Int64(booster(handle).inputWidth)
+}
+
+/// Attach an InputProjection given as JSON (null/empty clears it).
+@_cdecl("macboost_set_projection")
+public func macboost_set_projection(
+    _ handle: UnsafeMutableRawPointer?, _ json: UnsafePointer<CChar>?,
+    _ err: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let handle else { setError(err, "null argument"); return -1 }
+    do {
+        var proj: InputProjection?
+        if let json, json.pointee != 0 {
+            proj = try JSONDecoder().decode(InputProjection.self,
+                                            from: Data(String(cString: json).utf8))
+        }
+        try booster(handle).setProjection(proj)
+        return 0
+    } catch {
+        setError(err, "\(error)")
+        return -1
+    }
+}
+
+/// The projection as JSON (caller frees with macboost_free_string), or null.
+@_cdecl("macboost_projection")
+public func macboost_projection(_ handle: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>? {
+    guard let handle, let proj = booster(handle).projection,
+          let data = try? JSONEncoder().encode(proj),
+          let str = String(data: data, encoding: .utf8) else { return nil }
+    return strdup(str)
 }
 
 @_cdecl("macboost_num_trees")

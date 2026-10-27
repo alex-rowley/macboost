@@ -270,6 +270,10 @@ public final class MacBooster {
     /// Per-class base scores (single-element for non-multiclass).
     public private(set) var baseScores: [Float] = [0]
     public private(set) var calibration: Calibration?
+    /// Affine input map applied before the trees (see InputProjection).
+    public private(set) var projection: InputProjection?
+    /// Columns predict/fit expect: the projection's input width, else numFeatures.
+    public var inputWidth: Int { projection?.inputWidth ?? numFeatures }
     /// Number of classes the model was trained with (1 unless multiclass).
     public internal(set) var trainedNumClasses = 1
 
@@ -376,12 +380,11 @@ public final class MacBooster {
                 "X has \(X.count) values, expected rows*cols = \(rows * cols)")
         }
         return try X.withUnsafeBufferPointer { xp in
-            try fitImpl(X: MatrixView(base: xp.baseAddress!, rows: rows, cols: cols,
-                                      rowMajor: false),
-                        prebinned: nil, rows: rows, cols: cols, labels: labels,
-                        weights: weights, valid: valid,
-                        earlyStoppingRounds: earlyStoppingRounds,
-                        evalEvery: evalEvery, initModel: initModel, progress: progress)
+            try fit(view: MatrixView(base: xp.baseAddress!, rows: rows, cols: cols,
+                                     rowMajor: false),
+                    labels: labels, weights: weights, valid: valid,
+                    earlyStoppingRounds: earlyStoppingRounds,
+                    evalEvery: evalEvery, initModel: initModel, progress: progress)
         }
     }
 
@@ -395,10 +398,47 @@ public final class MacBooster {
                     earlyStoppingRounds: Int = 0, evalEvery: Int = 0,
                     initModel: MacBooster? = nil,
                     progress: ((String) -> Void)? = nil) throws -> FitTimings {
-        try fitImpl(X: view, prebinned: nil, rows: view.rows, cols: view.cols,
-                    labels: labels, weights: weights, valid: valid,
-                    earlyStoppingRounds: earlyStoppingRounds,
-                    evalEvery: evalEvery, initModel: initModel, progress: progress)
+        if let proj = projection {
+            guard view.cols == proj.inputWidth else {
+                throw MacBoostError.invalidInput(
+                    "projection expects \(proj.inputWidth) input columns, X has \(view.cols)")
+            }
+            let Z = proj.apply(view)
+            let validZ = try valid.map { v -> EvalSet in
+                guard v.featureMajor.count == v.rows * proj.inputWidth else {
+                    throw MacBoostError.invalidInput("valid set width does not match the projection input")
+                }
+                return EvalSet(featureMajor: proj.apply(featureMajor: v.featureMajor, rows: v.rows),
+                               rows: v.rows, labels: v.labels)
+            }
+            return try Z.withUnsafeBufferPointer { zp in
+                try fitImpl(X: MatrixView(base: zp.baseAddress!, rows: view.rows,
+                                          cols: proj.outputWidth, rowMajor: false),
+                            prebinned: nil, rows: view.rows, cols: proj.outputWidth,
+                            labels: labels, weights: weights, valid: validZ,
+                            earlyStoppingRounds: earlyStoppingRounds,
+                            evalEvery: evalEvery, initModel: initModel, progress: progress)
+            }
+        }
+        return try fitImpl(X: view, prebinned: nil, rows: view.rows, cols: view.cols,
+                           labels: labels, weights: weights, valid: valid,
+                           earlyStoppingRounds: earlyStoppingRounds,
+                           evalEvery: evalEvery, initModel: initModel, progress: progress)
+    }
+
+    /// Attach (or replace) the affine input map. On a trained model its output
+    /// width must equal the feature count the trees were built on.
+    public func setProjection(_ proj: InputProjection?) throws {
+        if let proj {
+            try proj.validate()
+            if !trees.isEmpty || numFeatures > 0 {
+                guard proj.outputWidth == numFeatures else {
+                    throw MacBoostError.invalidInput(
+                        "projection produces \(proj.outputWidth) columns, model has \(numFeatures) features")
+                }
+            }
+        }
+        projection = proj
     }
 
     /// Train from a preprocessed BinnedDataset (see makeDataset / .mbds
@@ -2070,6 +2110,10 @@ public final class MacBooster {
     }
 
     public func predict(featureMajor X: [Float], rows: Int, cols: Int) -> [Float] {
+        if let proj = projection, cols == proj.inputWidth, cols != numFeatures {
+            return predict(featureMajor: proj.apply(featureMajor: X, rows: rows),
+                           rows: rows, cols: numFeatures)
+        }
         var out = predictRawScores(featureMajor: X, rows: rows, cols: cols)
         if params.objective.usesLogLink {
             for i in 0..<out.count { out[i] = exp(out[i]) }
@@ -2207,6 +2251,7 @@ public final class MacBooster {
         var numClasses: Int?
         var baseScores: [Float]?
         var calibration: Calibration?
+        var projection: InputProjection?
     }
 
     public func save(to url: URL) throws {
@@ -2218,7 +2263,8 @@ public final class MacBooster {
                           trees: trees,
                           numClasses: trainedNumClasses,
                           baseScores: baseScores,
-                          calibration: calibration)
+                          calibration: calibration,
+                          projection: projection)
         try JSONEncoder().encode(m).write(to: url)
     }
 
@@ -2240,6 +2286,7 @@ public final class MacBooster {
         b.trainedNumClasses = m.numClasses ?? 1
         b.baseScores = m.baseScores ?? [m.baseScore]
         b.calibration = m.calibration
+        b.projection = m.projection
         return b
     }
 }

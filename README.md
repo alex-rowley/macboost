@@ -37,6 +37,9 @@ classification on dense data:**
 - **Calibration folded into the model**: Platt, temperature and prior-shift
   corrections become leaf and base-score edits, so the calibrated model is
   an ordinary model file — no wrapper to ship
+- **Input projection stored in the model**: a PCA (or several, plus
+  scalers) travels inside the model file and is applied at fit and
+  predict, so embedding pipelines ship one artifact
 - **Feature selection**: built-in Boruta (shadow features) — see below;
   no other GBM library ships this natively
 - **Workflow**: early stopping with per-iteration GPU validation eval,
@@ -128,7 +131,7 @@ dependencies):
 ```sh
 git clone https://github.com/alex-rowley/macboost && cd macboost
 swift build -c release        # library, CLI (.build/release/macboost), dylib
-swift test                    # 79 behavioural tests
+swift test                    # 82 behavioural tests
 ./scripts/build_wheel.sh && pip install python/dist/*.whl
 ```
 
@@ -295,7 +298,8 @@ ids outside `0..max_bin-2` go to the missing side in MacBoost but always
 left in XGBoost, so keep ids in range.
 
 **3. ONNX export.** Emit an `ai.onnx.ml` TreeEnsemble for onnxruntime
-(requires the `onnx` package to export, only onnxruntime to serve):
+(requires the `onnx` package to export, only onnxruntime to serve). A
+stored input projection is emitted as graph nodes in front of the trees:
 
 ```python
 model.save_onnx("model.onnx")
@@ -345,6 +349,51 @@ out-of-fold margins yourself and call `fold` on the all-rows model. The
 composed fold is stored in the model JSON under `calibration`, so a file
 states whether and how it was calibrated. Isotonic regression is not
 affine and cannot be folded; keep it as a wrapper if you need it.
+
+## Input projection (PCA inside the model)
+
+Dense embeddings are the one place trees want a rotation: a 1024-wide
+vector spreads each signal across hundreds of coordinates, a tree cuts
+one coordinate at a time, and a variance-ordered basis turns those
+directions into single axes that carry whole splits. The basis then has
+to ship with the model. MacBoost stores it in the model file instead: an
+affine map of blocks `matrix · (x[inputs] − mean)` plus passthrough
+columns, applied before the trees at fit and predict alike.
+
+```python
+from macboost import Projection
+
+pca = PCA(128).fit(E_train)                       # sklearn, or your own SVD
+proj = Projection.from_pca(pca.components_, pca.mean_,
+                           input_width=E.shape[1] + 2,
+                           inputs=range(E.shape[1]),   # the embedding columns
+                           passthrough=[1024, 1025])   # tabular columns, untouched
+
+model = MacBoostClassifier(n_estimators=500, projection=proj)
+model.fit(X_raw, y)                                # raw width in
+model.predict_proba(X_raw_test)                    # raw width in
+model.save_model("model.json")                     # basis travels inside
+
+trained_on_scores.set_projection(proj)            # attach to an existing model
+model.projection_                                 # the stored Projection
+```
+
+Any number of blocks compose: N PCAs over different column groups, a
+scaler in front of one of them, a PCA of a PCA, all reduce to one affine
+map. `fill` gives a per-column NaN replacement before projection (PCA
+cannot take NaN); passthrough columns keep MacBoost's native NaN routing.
+Everything downstream, including feature importance, SHAP, Boruta,
+monotone constraints and categorical declarations, refers to the
+projected columns, which is what the trees were built on. The pure-Python
+scorer and the ONNX export apply the projection themselves (ONNX as
+Gather/Sub/MatMul nodes in front of the ensemble); the XGBoost JSON
+format cannot carry it, so that export refuses a projected model. The
+CLI scores projected models from their file but does not fit them; that
+is a Python or Swift workflow.
+
+This is a stored step, not a fold: an oblique split `w·x ≤ t` has no
+axis-aligned equivalent, so the trees cannot absorb the rotation the way
+they absorb a calibration. What you get is exactness and one artifact.
 
 ## Feature selection (Boruta, GPU-resident)
 
@@ -450,7 +499,7 @@ within ±0.03 of alpha).
 
 ## Tests
 
-`swift test` runs 79 behavioural tests adapted from the LightGBM and
+`swift test` runs 82 behavioural tests adapted from the LightGBM and
 XGBoost open-source suites (upstream sources cited per test in
 `Tests/MacBoostTests/`):
 
@@ -466,12 +515,13 @@ XGBoost open-source suites (upstream sources cited per test in
   degradation proves sampling actually engages
 - **Bit-exactness**: GPU inference ≡ CPU inference; save/load round-trips
   to identical predictions; `.mbds`-trained ≡ raw-trained; a calibration
-  fold is an exact affine map on the margin that composes and round-trips
+  fold is an exact affine map on the margin that composes and round-trips;
+  a stored projection scores raw and pre-projected input identically
 - End-to-end surfaces: `scripts/test_cli.sh` (CSV/TSV/LibSVM/mbds/
   multiclass/importance flows) and `uv run scripts/test_python.py`
-  (97 checks: sklearn interop incl. real GridSearchCV/cross_val_score
+  (109 checks: sklearn interop incl. real GridSearchCV/cross_val_score
   runs, objectives, weights, multiclass with string labels, SHAP,
-  guardrails, calibration folds, MLX/PyTorch array interop)
+  guardrails, calibration folds, input projections, MLX/PyTorch array interop)
 
 These tests caught real bugs during development — a double-applied
 learning rate under bagging, a monotonicity leak from crossed bounds in

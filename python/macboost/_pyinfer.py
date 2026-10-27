@@ -39,6 +39,8 @@ class PyModel:
         self.base_scores = np.asarray(
             m.get("baseScores") or [m["baseScore"]], dtype=np.float32)
         self.feature_names = m.get("featureNames")
+        from .projection import Projection
+        self.projection = Projection.from_dict(m.get("projection"))
         self._raw = m
         self.trees = []
         for t in m["trees"]:
@@ -91,6 +93,10 @@ class PyModel:
 
     def predict_raw(self, X):
         X = np.asarray(X, dtype=np.float32)
+        if self.projection is not None and X.ndim == 2 \
+                and X.shape[1] == self.projection.input_width \
+                and X.shape[1] != self.num_features:
+            X = self.projection.apply(X)
         if X.ndim != 2 or X.shape[1] != self.num_features:
             raise ValueError(
                 f"X must be (n, {self.num_features}), got {X.shape}")

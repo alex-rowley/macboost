@@ -62,6 +62,12 @@ extension MacBooster {
             throw MacBoostError.invalidInput(
                 "selection data shapes inconsistent (rows=\(rows), cols=\(cols), X=\(X.count))")
         }
+        if let proj = projection, cols == proj.inputWidth, cols != proj.outputWidth {
+            return try selectFeatures(featureMajor: proj.apply(featureMajor: X, rows: rows),
+                                      rows: rows, cols: proj.outputWidth, labels: labels,
+                                      weights: weights, rounds: rounds, trees: trees,
+                                      alpha: alpha, seed: seed, progress: progress)
+        }
         guard labels.count == rows else {
             throw MacBoostError.invalidInput("labels has \(labels.count) rows, X has \(rows)")
         }

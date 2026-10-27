@@ -17,6 +17,10 @@ cross_val_score work.
 Calibration folds into the trees: model.fold(A, B) applies margin' = A*margin
 + B in place (Platt, temperature, prior shift), and classifier.calibrate(X, y)
 fits it on held-out rows. The result is an ordinary model file.
+
+An affine input projection (PCA, scalers) can be stored in the model too:
+MacBoostRegressor(projection=Projection.from_pca(...)) or
+model.set_projection(...). Raw-width X goes in at fit and predict.
 """
 
 import numpy as np
@@ -35,7 +39,9 @@ except ImportError:
     class _SkRegressor: pass
     class _SkClassifier: pass
 
-__all__ = ["MacBoostRegressor", "MacBoostClassifier", "MacBoostError"]
+from .projection import Projection
+
+__all__ = ["MacBoostRegressor", "MacBoostClassifier", "MacBoostError", "Projection"]
 __version__ = "1.5.0"
 
 # Native LightGBM / XGBoost spellings -> canonical macboost names.
@@ -68,7 +74,7 @@ _ALIASES = {
 
 _PARAM_NAMES = (
     "n_estimators", "max_depth", "learning_rate", "num_leaves", "reg_lambda",
-    "min_child_weight", "min_split_gain", "max_bin", "categorical_features",
+    "min_child_weight", "min_split_gain", "max_bin", "categorical_features", "projection",
     "cat_smooth", "cat_l2", "min_data_per_group", "max_cat_threshold",
     "early_stopping_rounds", "verbose",
     "goss", "goss_top_rate", "goss_other_rate",
@@ -124,7 +130,7 @@ class _BaseBooster:
                  objective=None, alpha=0.9, tweedie_variance_power=1.5,
                  scale_pos_weight=1.0, subsample=1.0, colsample_bytree=1.0,
                  monotone_constraints=None, metric="auto",
-                 importance_type="gain", feature_selection=False,
+                 importance_type="gain", projection=None, feature_selection=False,
                  selection_rounds=20, selection_estimators=None,
                  selection_alpha=0.05,
                  allowed_features=None, **aliases):
@@ -155,6 +161,7 @@ class _BaseBooster:
         self.monotone_constraints = monotone_constraints
         self.metric = metric
         self.importance_type = importance_type
+        self.projection = projection
         self.feature_selection = feature_selection
         self.selection_rounds = selection_rounds
         self.selection_estimators = selection_estimators
@@ -218,6 +225,9 @@ class _BaseBooster:
             cfg["allowed_features"] = [int(f) for f in self.allowed_features]
         if self.num_leaves:
             cfg["num_leaves"] = int(self.num_leaves)
+        proj = Projection.coerce(self.projection)
+        if proj is not None:
+            cfg["projection"] = proj.to_dict()
         return cfg
 
     def select_features(self, X, y, sample_weight=None, rounds=None,
@@ -240,6 +250,9 @@ class _BaseBooster:
         cfg = self._config(0, 0)
         cfg.pop("allowed_features", None)
         X, y = _interop.to_numpy(X), _interop.to_numpy(y)
+        proj = Projection.coerce(cfg.pop("projection", None))
+        if proj is not None:                 # select in projected space
+            X = proj.apply(X)
         sample_weight = _interop.to_numpy(sample_weight)
         y = self._encode_labels(y)
         if self.classes_ is not None and len(self.classes_) > 2:
@@ -432,9 +445,42 @@ class _BaseBooster:
 
     @property
     def n_features_in_(self):
+        """Raw input width (the projection's input width when one is set)."""
         if getattr(self, "_pymodel", None) is not None:
-            return self._pymodel.num_features
-        return _core.num_features(self._handle) if self._handle else 0
+            pm = self._pymodel
+            return pm.projection.input_width if pm.projection is not None else pm.num_features
+        return _core.input_width(self._handle) if self._handle else 0
+
+    def set_projection(self, projection):
+        """Attach an affine input map (macboost.Projection or its dict form,
+        None to clear) to a trained model whose trees were built on the
+        projected columns. Raw-width X goes in from then on."""
+        proj = Projection.coerce(projection)
+        d = None if proj is None else proj.to_dict()
+        if getattr(self, "_pymodel", None) is not None:
+            pm = self._pymodel
+            if proj is not None and proj.output_width != pm.num_features:
+                raise ValueError(f"projection produces {proj.output_width} columns, "
+                                 f"model has {pm.num_features} features")
+            pm.projection = proj
+            if d is None:
+                pm._raw.pop("projection", None)
+            else:
+                pm._raw["projection"] = d
+        elif self._handle is None:
+            raise MacBoostError("model is not fitted")
+        else:
+            _core.set_projection(self._handle, d)
+        return self
+
+    @property
+    def projection_(self):
+        """The stored input projection (macboost.Projection) or None."""
+        if getattr(self, "_pymodel", None) is not None:
+            return self._pymodel.projection
+        if self._handle is None:
+            return None
+        return Projection.from_dict(_core.projection(self._handle))
 
     # Back-compat spelling.
     n_features_ = n_features_in_
