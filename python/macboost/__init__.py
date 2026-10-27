@@ -42,7 +42,7 @@ except ImportError:
 from .projection import Projection
 
 __all__ = ["MacBoostRegressor", "MacBoostClassifier", "MacBoostError", "Projection"]
-__version__ = "1.6.0"
+__version__ = "1.6.1"
 
 # Native LightGBM / XGBoost spellings -> canonical macboost names.
 _ALIASES = {
